@@ -6,7 +6,6 @@
 #include <freertos/task.h>
 #include <freertos/queue.h>
 #include <math.h>
-#include <opus.h>
 
 #include "config.h"
 #include "pins_config.h"
@@ -14,18 +13,8 @@
 namespace {
 
 QueueHandle_t s_pcmQueue = nullptr;
-QueueHandle_t s_opusQueue = nullptr;
 volatile bool s_capturing = false;
-volatile bool s_opusEnabled = false;
 volatile bool s_silenceTimeoutHit = false;
-OpusEncoder *s_encoder = nullptr;
-
-// One encoded uplink frame. 60ms of 16kHz mono speech at ~24kbps VBR is
-// ~180 bytes; the cap leaves generous headroom.
-struct OpusFrame {
-  uint16_t len;
-  uint8_t data[OPUS_MAX_FRAME_BYTES];
-};
 
 void captureTask(void *) {
   // 32-bit read + >>14 shift, matching espressif/esp-skainet's actual
@@ -47,14 +36,14 @@ void captureTask(void *) {
 
     size_t bytesRead = 0;
     i2s_read(I2S_NUM_1, raw, sizeof(raw), &bytesRead, portMAX_DELAY);
-    if (bytesRead < sizeof(raw)) continue;  // Opus needs exactly full frames
+    if (bytesRead < sizeof(raw)) continue;  // uplink wants full chunks only
 
     for (size_t i = 0; i < AUDIO_CHUNK_SAMPLES; i++) {
       buf[i] = (int16_t)(raw[i] >> 14);
     }
 
-    // Energy-based VAD: RMS over the frame. Diagnostic only — the xiaozhi
-    // backend does the real endpointing server-side in "auto" listen mode.
+    // Energy-based VAD: RMS over the frame. Diagnostic only — the AI
+    // engine does the real endpointing server-side on the streamed audio.
     int64_t sumSquares = 0;
     for (size_t i = 0; i < AUDIO_CHUNK_SAMPLES; i++) {
       sumSquares += (int32_t)buf[i] * (int32_t)buf[i];
@@ -73,53 +62,11 @@ void captureTask(void *) {
   }
 }
 
-// Opus encode runs in its own task: libopus needs ~25KB of stack, far more
-// than the capture task or the Arduino loop task have.
-void encodeTask(void *) {
-  static int16_t pcm[AUDIO_CHUNK_SAMPLES];
-  static OpusFrame frame;
-
-  for (;;) {
-    if (!s_opusEnabled) {
-      vTaskDelay(pdMS_TO_TICKS(50));
-      continue;
-    }
-    if (xQueueReceive(s_pcmQueue, pcm, pdMS_TO_TICKS(100)) != pdTRUE) continue;
-    if (s_encoder == nullptr) continue;
-
-    opus_int32 n = opus_encode(s_encoder, pcm, AUDIO_CHUNK_SAMPLES, frame.data,
-                               sizeof(frame.data));
-    if (n <= 0) {
-      Serial.printf("[Opus] encode failed: %d\n", (int)n);
-      continue;
-    }
-    frame.len = (uint16_t)n;
-    if (xQueueSend(s_opusQueue, &frame, 0) != pdTRUE) {
-      Serial.println("[Opus] uplink queue full, dropped frame");
-    }
-  }
-}
-
 }  // namespace
 
 void audioCaptureInit() {
-  s_pcmQueue = xQueueCreate(4, AUDIO_CHUNK_BYTES);
-  s_opusQueue = xQueueCreate(4, sizeof(OpusFrame));
-
-  int err = 0;
-  s_encoder = opus_encoder_create(AUDIO_SAMPLE_RATE, AUDIO_CHANNELS,
-                                  OPUS_APPLICATION_VOIP, &err);
-  if (err != OPUS_OK || s_encoder == nullptr) {
-    Serial.printf("[Opus] encoder create failed: %d\n", err);
-    s_encoder = nullptr;
-  } else {
-    // Complexity 3 keeps a 60ms frame well under its real-time budget on
-    // the S3 at 240MHz; VBR ~24kbps is plenty for 16kHz speech ASR.
-    opus_encoder_ctl(s_encoder, OPUS_SET_COMPLEXITY(3));
-    opus_encoder_ctl(s_encoder, OPUS_SET_BITRATE(24000));
-    opus_encoder_ctl(s_encoder, OPUS_SET_VBR(1));
-    opus_encoder_ctl(s_encoder, OPUS_SET_SIGNAL(OPUS_SIGNAL_VOICE));
-  }
+  // ~8 chunks of backlog (~0.5s) so a brief WiFi stall doesn't drop audio.
+  s_pcmQueue = xQueueCreate(8, AUDIO_CHUNK_BYTES);
 
   i2s_config_t i2sConfig = {
       .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
@@ -135,7 +82,7 @@ void audioCaptureInit() {
                                                              // but-uncorrelated-with-loudness signal
       .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
       .dma_buf_count = 6,
-      .dma_buf_len = 480,  // 960-sample frames span two DMA buffers
+      .dma_buf_len = 480,  // chunk frames span multiple DMA buffers
       .use_apll = false,
       .tx_desc_auto_clear = false,
       .fixed_mclk = 0,
@@ -152,7 +99,6 @@ void audioCaptureInit() {
   i2s_set_pin(I2S_NUM_1, &pinConfig);
 
   xTaskCreatePinnedToCore(captureTask, "audio_capture", 4096, nullptr, 5, nullptr, 1);
-  xTaskCreatePinnedToCore(encodeTask, "opus_encode", 32768, nullptr, 4, nullptr, 1);
 }
 
 void audioCaptureStart() {
@@ -164,20 +110,8 @@ void audioCaptureStop() {
   s_capturing = false;
 }
 
-void audioCaptureEnableOpus(bool enabled) {
-  s_opusEnabled = enabled;
-}
-
 bool audioCaptureDequeueChunk(uint8_t *outBuf) {
   return xQueueReceive(s_pcmQueue, outBuf, 0) == pdTRUE;
-}
-
-size_t audioCaptureDequeueOpus(uint8_t *outBuf, size_t cap) {
-  static OpusFrame frame;
-  if (xQueueReceive(s_opusQueue, &frame, 0) != pdTRUE) return 0;
-  if (frame.len > cap) return 0;
-  memcpy(outBuf, frame.data, frame.len);
-  return frame.len;
 }
 
 bool audioCaptureSilenceTimeoutHit() {

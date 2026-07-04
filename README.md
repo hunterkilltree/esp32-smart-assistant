@@ -3,50 +3,57 @@
 A **real-time streaming voice assistant** for the **ESP32-S3-EYE v2.2** with an
 expressive, colorful face on the onboard LCD.
 
-The firmware speaks the **[xiaozhi](https://github.com/78/xiaozhi-esp32)
-WebSocket protocol**: it streams live Opus-encoded microphone audio to a
-xiaozhi backend — the free official **xiaozhi.me** cloud or a self-hosted
-[xiaozhi-esp32-server](https://github.com/xinnan-tech/xiaozhi-esp32-server) —
-which runs VAD + ASR + LLM + TTS and streams Opus TTS audio back. All heavy
-AI work happens on the backend, never on the device.
+The firmware connects **directly to an AI provider's realtime voice API** over
+one WebSocket — no middle backend to run. Pick the engine in `secrets.h`:
+
+- **Gemini Live API** (`AI_ENGINE_GEMINI`) — free-tier API key from
+  [Google AI Studio](https://aistudio.google.com/apikey)
+- **OpenAI Realtime API** (`AI_ENGINE_OPENAI`) — paid API key from
+  [platform.openai.com](https://platform.openai.com/api-keys)
+
+Live microphone PCM streams up; the provider runs VAD + ASR + LLM + TTS
+server-side and streams spoken PCM audio back. The model is given a
+`set_emotion` tool and calls it before every reply — that tool call picks the
+face (smile / sad / neutral) shown on the LCD. All heavy AI work happens in
+the cloud, never on the device.
 
 ```
 [ESP32-S3-EYE v2.2]
    │
-   │  Opus audio frames (WebSocket, binary) + JSON control messages
+   │  16/24 kHz PCM (base64 in JSON, WebSocket) — both directions
    ▼
-[xiaozhi backend]  (xiaozhi.me cloud or self-hosted)
+[AI engine]  (Gemini Live API  or  OpenAI Realtime API)
    ├── Server-side VAD + streaming ASR
-   ├── LLM (Qwen / DeepSeek / configurable)
-   ├── Streaming TTS
+   ├── LLM + set_emotion tool call  ──►  LCD face (happy/sad/neutral)
+   ├── Streaming TTS (24 kHz PCM)
    ▼
 [ESP32 Response Layer]
-   ├── Speaker playback (Opus decode → I2S, external amp)
-   ├── LCD facial expression + status (driven by server `llm` emotions)
+   ├── Speaker playback (I2S, external amp)
+   ├── LCD facial expression + status
    └── RGB LED feedback
 ```
 
 ## Features
 
-- **Live audio streaming** — continuous 16 kHz mono PCM, Opus-encoded in
-  60 ms frames, over WebSocket while listening. Record-then-send is
-  explicitly *not* the main flow.
-- **Real backend, zero backend work** — first boot shows a 6-digit
-  activation code on the LCD; enter it at [xiaozhi.me](https://xiaozhi.me)
-  (Console → Add Device) and the assistant is live against the free
-  official cloud. Self-hosted servers work by changing two URLs in
-  `secrets.h`.
-- **Boot self-test** — every pin, peripheral, and configuration value is
-  verified **before the main flow starts**, with results shown on the LCD as
-  a colored PASS / WARN / FAIL / SKIP checklist plus a summary screen.
-- **Expressive LCD face** — the assistant state and server-sent `llm`
-  emotions (`happy`, `sad`, `thinking`, …) are drawn as colorful faces,
-  with a status bar and live WiFi/WebSocket connectivity dots.
+- **Live audio streaming** — continuous mono 16-bit PCM (16 kHz for Gemini,
+  24 kHz for OpenAI) in 60 ms chunks over WebSocket while listening.
+  Record-then-send is explicitly *not* the main flow.
+- **No backend to host** — the device talks straight to the provider; the
+  only setup is pasting an API key into `secrets.h`.
+- **Model-driven emotions** — a `set_emotion(happy|sad|neutral|thinking)`
+  function is registered with the engine; the system prompt tells the model
+  to call it before every reply, and the firmware maps the call to the face.
+- **Boot self-test** — every pin, peripheral, and configuration value
+  (WiFi, API key) is verified **before the main flow starts**, with results
+  shown on the LCD as a colored PASS / WARN / FAIL / SKIP checklist plus a
+  summary screen.
+- **Expressive LCD face** — assistant states and model emotions are drawn
+  as colorful faces, with a status bar and live WiFi/WebSocket dots.
 - **Continuous conversation** — one button press opens a session; after
-  each TTS reply the mic reopens automatically until you press the button
-  again (or the server says goodbye). A press during a reply barges in.
+  each spoken reply the mic reopens automatically until you press the
+  button again. A press during a reply barges in.
 - **Reliability** — WiFi reconnect with exponential backoff, WS
-  auto-reconnect + hello re-handshake, ArduinoOTA updates, task watchdog.
+  auto-reconnect + session re-setup, ArduinoOTA updates, task watchdog.
 
 ## Buttons
 
@@ -59,7 +66,7 @@ something:
 | **PLAY** | ADC ladder, GPIO1 | Same as BOOT (talk), without the strapping-pin quirks |
 | **UP+** | ADC ladder, GPIO1 | Volume +10% (software gain, saved to flash, on-screen bar) |
 | **DN−** | ADC ladder, GPIO1 | Volume −10% |
-| **MENU** | ADC ladder, GPIO1 | Toggle info screen: state, WiFi/IP/RSSI, WS status, Device-Id, volume, heap |
+| **MENU** | ADC ladder, GPIO1 | Toggle info screen: state, WiFi/IP/RSSI, AI link status, engine, volume, heap |
 
 MENU/PLAY/UP/DN share one pin — a resistor ladder on GPIO1 where each
 button produces a distinct voltage. The mV windows in `config.h`
@@ -71,37 +78,29 @@ Presses that match no window are logged with their measured mV.
 
 | Expression | Color | Shown when |
 |---|---|---|
-| Neutral (soft smile) | Cyan | `IDLE` — ready | 
+| Neutral (soft smile) | Cyan | `IDLE` — ready, or model emotion `neutral` |
 | Listening (big eyes) | Azure | `LISTENING` — mic open, streaming |
-| Thinking (flat mouth + dots) | Yellow | `THINKING` — server transcribed, LLM working |
+| Thinking (flat mouth + dots) | Yellow | `THINKING` — model working on a reply |
 | Speaking (open mouth) | Orange | `SPEAKING` — TTS audio playing |
-| Happy (wide smile) | Green | server emotion `happy`/`laughing`/`loving`/… |
-| Sad (frown + tear) | Red | server emotion `sad`/`crying`/`angry`/… |
+| Happy (wide smile) | Green | model called `set_emotion("happy")` |
+| Sad (frown + tear) | Red | model called `set_emotion("sad")` |
 
 ## State machine
 
 `IDLE → LISTENING → THINKING → SPEAKING → LISTENING (continuous) → … → IDLE`
 
-- **BOOT button** in `IDLE` starts a conversation (`listen start`, mode
-  `auto` — the server does the endpointing; no on-device wake word, see
-  `PROGRESS.md`).
-- `LISTENING → THINKING` when the server sends the `stt` transcription.
-- `THINKING → SPEAKING` on `tts start`; TTS Opus frames stream in.
-- `SPEAKING → LISTENING` on `tts stop` while the conversation is active.
+- **BOOT button** in `IDLE` starts a conversation — the mic streams
+  continuously and the engine does the endpointing server-side (no
+  on-device wake word, see `PROGRESS.md`).
+- `LISTENING → THINKING` when the engine reports the utterance ended
+  (OpenAI `speech_stopped`; Gemini has no explicit event, so the face jumps
+  straight to the reply).
+- `THINKING → SPEAKING` on the first TTS audio chunk; the `set_emotion`
+  tool call lands just before it and sets the face.
+- `SPEAKING → LISTENING` when the turn completes while the conversation is
+  active.
 - BOOT button during `LISTENING` stops; during `THINKING`/`SPEAKING` aborts.
-- `THINKING → IDLE` automatically after 15 s if the server never answers.
-
-## First-boot activation (official cloud)
-
-1. Flash, connect WiFi (via `secrets.h`).
-2. After the self-test, the device POSTs its identity to the xiaozhi OTA
-   endpoint. An unbound device gets back a **6-digit code**, shown big on
-   the LCD.
-3. Register at [xiaozhi.me](https://xiaozhi.me), open the console, choose
-   *Add Device*, and enter the code.
-4. The device re-polls every 10 s (BOOT button forces an immediate
-   re-check), sees it's bound, connects the WebSocket, and shows the green
-   "Connected!" face. Done — press BOOT and talk.
+- `THINKING → IDLE` automatically after 15 s if the engine never answers.
 
 ## Boot self-test
 
@@ -113,7 +112,7 @@ paints each result on the LCD **before entering the main flow**:
 | `PSRAM` | Octal PSRAM detected (camera needs it) | PASS, 8 MB |
 | `LED` | RGB status LED cycles red/green/blue | PASS (visual) |
 | `BUTTON` | Wake button reads released, not stuck | PASS |
-| `CONFIG` | `secrets.h` filled in, WS URL is ws(s):// | PASS once filled in |
+| `CONFIG` | `secrets.h`: WiFi + selected engine's API key filled in | PASS once filled in |
 | `WIFI` | Connects to the AP within 15 s, shows IP | PASS with real credentials |
 | `MIC` | I2S capture delivers live, non-flat PCM | PASS (see known issues) |
 | `SPKR` | — | SKIP by design (no amp wired) |
@@ -140,27 +139,30 @@ pins are only tagged `[CONFIRMED — DO NOT CHANGE]` after the dedicated
 pin-check firmware proved them on real hardware with an explicit human
 confirmation. **Do not change confirmed pins without re-running pin-check.**
 
-## Wire protocol (xiaozhi, WebSocket transport, protocol version 1)
+## Wire protocol
 
-Spec: [xiaozhi-esp32/docs/websocket.md](https://github.com/78/xiaozhi-esp32/blob/main/docs/websocket.md).
-Implemented in `src/XiaozhiProtocol.cpp`.
+Both engines follow the same shape — one TLS WebSocket, a JSON setup
+message, then base64 PCM chunks both ways — implemented behind the common
+interface in `include/AiEngine.h`:
 
-- **Connect headers**: `Authorization: Bearer <token>`,
-  `Protocol-Version: 1`, `Device-Id: <mac>`, `Client-Id: <persistent uuid>`.
-- **Handshake**: client sends
-  `{"type":"hello","version":1,"transport":"websocket","audio_params":{"format":"opus","sample_rate":16000,"channels":1,"frame_duration":60}}`;
-  server answers with its own `hello` carrying `session_id` and the
-  downlink `sample_rate` (24 kHz on the official cloud). 10 s timeout.
-- **Binary frames**: one raw Opus frame each — device→server 16 kHz mono
-  60 ms, server→device at the hello-announced rate.
-- **Device → server JSON**: `listen` (`start`/`stop`, mode `auto`), `abort`.
-- **Server → device JSON**: `stt` (transcription), `llm` (`emotion` → face),
-  `tts` (`start`/`stop`/`sentence_start`), `goodbye`, `system` (reboot).
+- **Gemini Live** (`src/GeminiLive.cpp`) — WSS to
+  `generativelanguage.googleapis.com` (`BidiGenerateContent`, key in the
+  URL). A `setup` message configures the model, system prompt, and the
+  `set_emotion` tool; mic audio goes up as `realtimeInput` (16 kHz PCM),
+  replies come back in `serverContent` messages (24 kHz PCM +
+  `turnComplete`/`interrupted` flags), tool calls arrive as `toolCall`.
+  [Docs](https://ai.google.dev/api/live)
+- **OpenAI Realtime** (`src/OpenAiRealtime.cpp`) — WSS to
+  `api.openai.com/v1/realtime` (`Authorization: Bearer` header). A
+  `session.update` event configures voice, server VAD, prompt, and the
+  tool; mic audio goes up as `input_audio_buffer.append`, replies come
+  back as `response.output_audio.delta` events, tool calls as
+  `response.function_call_arguments.done`.
+  [Docs](https://platform.openai.com/docs/guides/realtime)
 
-The device identity (`Device-Id` = WiFi MAC, `Client-Id` = UUID persisted in
-NVS) is also sent as headers on the OTA/activation check
-(`src/XiaozhiOta.cpp`), which returns the WebSocket URL/token and, for an
-unbound device, the activation code.
+Session setup must complete within 10 s or the socket is recycled; a
+dropped socket auto-reconnects and re-runs setup (conversation context is
+lost on reconnect).
 
 ## Getting started
 
@@ -169,9 +171,10 @@ Requires [PlatformIO](https://platformio.org/) (VS Code extension or CLI).
 ```bash
 # 1. Create your secrets file (auto-created from the template on first build)
 cp include/secrets.h.example include/secrets.h
-#    ...then edit include/secrets.h: WiFi credentials. The xiaozhi URLs
-#    default to the official cloud; point them at your own server if you
-#    self-host.
+#    ...then edit include/secrets.h:
+#      - WiFi credentials
+#      - AI_ENGINE (AI_ENGINE_GEMINI or AI_ENGINE_OPENAI)
+#      - the matching API key (GEMINI_API_KEY / OPENAI_API_KEY)
 
 # 2. Build + flash (auto-detects the port; -p COM3 to force one)
 ./upload_project.sh -p COM3
@@ -180,8 +183,8 @@ cp include/secrets.h.example include/secrets.h
 ./upload_project.sh -p COM3 -m
 ```
 
-The board shows the rainbow splash, runs the self-test checklist, then either
-the activation-code screen (first boot) or the cyan "Ready" face.
+The board shows the rainbow splash, runs the self-test checklist, connects
+to the engine, and shows the green "Connected!" face. Press BOOT and talk.
 
 ### Pin-check diagnostic firmware
 
@@ -198,23 +201,24 @@ tone, camera capture):
 ```
 include/
   pins_config.h      # all pin assignments + verification status legend
-  config.h           # timing, audio/Opus, self-test tunables
-  secrets.h.example  # template for WiFi + xiaozhi endpoints (secrets.h is gitignored)
+  config.h           # engine/model selection, prompt, timing, audio, self-test tunables
+  secrets.h.example  # template for WiFi + AI engine + API keys (secrets.h is gitignored)
   AssistantState.h   # IDLE / LISTENING / THINKING / SPEAKING
+  AiEngine.h         # common engine interface (callbacks, connect, audio in/out)
 src/
   main.cpp           # thin boot sequence + loop pipeline (each stage is a module)
   AppState.cpp       # state machine + face/LED feedback
   AdcButtons.cpp     # 4-button ADC ladder driver (GPIO1): debounce + mV log
   Controls.cpp       # PLAY=talk, UP/DN=volume, MENU=info screen
   WifiLink.cpp       # WiFi reconnect/backoff + ArduinoOTA servicing
-  BackendSession.cpp # OTA check -> activation code screen -> WS connect
-  Conversation.cpp   # protocol callbacks, button, mic->server pump, timeouts
-  XiaozhiProtocol.cpp# xiaozhi WS protocol: hello, listen/abort, tts/llm/stt, opus frames
-  XiaozhiOta.cpp     # OTA/config check + first-boot activation code
+  BackendSession.cpp # engine WebSocket bring-up
+  Conversation.cpp   # engine callbacks, button, mic->engine pump, timeouts
+  GeminiLive.cpp     # Gemini Live API client (AI_ENGINE_GEMINI)
+  OpenAiRealtime.cpp # OpenAI Realtime API client (AI_ENGINE_OPENAI)
   SelfTest.cpp       # boot self-test (pins, peripherals, config) on the LCD
-  Display.cpp        # ST7789 UI: splash, checklist, faces, activation screen
-  AudioCapture.cpp   # I2S mic RX task + Opus encode task (60ms frames)
-  AudioPlayback.cpp  # Opus decode task + I2S TX (skipped while no speaker pins)
+  Display.cpp        # ST7789 UI: splash, checklist, faces, info screen
+  AudioCapture.cpp   # I2S mic RX task -> 60 ms PCM chunks
+  AudioPlayback.cpp  # PCM ring buffer -> I2S TX (skipped while no speaker pins)
   CameraCapture.cpp  # OV2640 init + JPEG snapshot (self-test/pin-check only)
   Reliability.cpp    # watchdog, ArduinoOTA
   PinCheckMain.cpp   # standalone pin-check firmware (separate env)
@@ -222,8 +226,8 @@ src/
 
 The `loop()` is a fixed four-stage pipeline — each stage returns early if its
 layer isn't ready, so a bug is isolated to whichever module's log prefix
-stops appearing: `wifiLinkLoop()` → `backendSessionLoop()` → `xzLoop()` →
-`conversationLoop()`.
+stops appearing: `wifiLinkLoop()` → `backendSessionLoop()` → `aiEngineLoop()`
+→ `conversationLoop()`.
 
 ## Known issues
 
@@ -233,23 +237,26 @@ stops appearing: `wifiLinkLoop()` → `backendSessionLoop()` → `xzLoop()` →
   sound. Full investigation in `include/pins_config.h` and `PROGRESS.md`.
   Until that's resolved (continuity/oscilloscope check, or an external I2S
   mic), the assistant can't actually hear you — the whole pipeline runs,
-  but the server only ever receives silence.
+  but the engine only ever receives silence.
 - **Speaker pins are unverified guesses** — the stock board has no speaker
   interface at all. Wire an external I2S amp and confirm pins via pin-check
   first (GPIO46 is a strapping pin — risky at boot). Until then TTS replies
-  are received and decoded but inaudible.
-- **TLS is unpinned** — the WS/HTTPS clients use `setInsecure()` (no CA
-  validation), like most hobby firmware. Pin the ISRG root via
+  are received but inaudible.
+- **TLS is unpinned** — the WS client uses `setInsecure()` (no CA
+  validation), like most hobby firmware. Pin the provider's root CA via
   `beginSslWithCA` if you care.
+- **Voice barge-in needs an open mic** — the mic only streams while
+  `LISTENING`, so interrupting a reply currently requires the button, not
+  your voice. Trivial to change once the mic hardware actually works.
 - **Camera / vision is idle** — snapshots still work in the self-test, but
-  the xiaozhi vision path needs the MCP feature, which this firmware
-  doesn't implement yet.
+  no image is sent to the engine yet.
 
 ## Roadmap
 
 - Fix or replace the mic (hardware) → first real end-to-end conversation
 - External I2S amp for audible TTS
-- MCP device tools (vision/camera, LED control, volume)
+- Camera snapshots to the engine (both APIs accept images) — "what am I
+  looking at?"
 - On-device wake word (ESP-SR) — needs an ESP-IDF-based build restructure
 
 ## Libraries
@@ -257,11 +264,11 @@ stops appearing: `wifiLinkLoop()` → `backendSessionLoop()` → `xzLoop()` →
 | Purpose | Library |
 |---|---|
 | WebSocket streaming | `links2004/WebSockets` |
-| Opus encode/decode | `pschatzmann/arduino-libopus` |
-| Control JSON | `bblanchon/ArduinoJson` |
+| JSON (setup, events, base64 audio envelopes) | `bblanchon/ArduinoJson` |
 | RGB LED | `adafruit/Adafruit NeoPixel` |
 | Button debounce | `thomasfredericks/Bounce2` |
 | LCD UI | `adafruit/Adafruit GFX` + `Adafruit ST7735 and ST7789` |
 
-WiFi, I2S, camera, ring buffers, OTA, and the watchdog come from the
-`arduino-esp32` core.
+WiFi, I2S, base64 (mbedTLS), camera, ring buffers, OTA, and the watchdog
+come from the `arduino-esp32` core — no audio codec library is needed since
+both engines speak raw PCM.

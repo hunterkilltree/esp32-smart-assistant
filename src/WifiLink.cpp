@@ -6,7 +6,7 @@
 #include "config.h"
 #include "Display.h"
 #include "Reliability.h"
-#include "XiaozhiProtocol.h"
+#include "AiEngine.h"
 
 namespace {
 
@@ -26,7 +26,7 @@ bool wifiLinkLoop() {
   if (WiFi.status() != WL_CONNECTED) {
     if (s_everConnected) {
       // Reflect the drop on-screen once, not every loop iteration.
-      displayShowConnectivity(false, xzSocketConnected());
+      displayShowConnectivity(false, aiEngineSocketConnected());
     }
     s_everConnected = false;
     unsigned long now = millis();
@@ -45,7 +45,7 @@ bool wifiLinkLoop() {
     s_retryShift = 0;
     Serial.printf("[WiFi] Connected, IP: %s\n",
                   WiFi.localIP().toString().c_str());
-    displayShowConnectivity(true, xzSocketConnected());
+    displayShowConnectivity(true, aiEngineSocketConnected());
     reliabilityInitOTA();
   }
   reliabilityHandleOTA();

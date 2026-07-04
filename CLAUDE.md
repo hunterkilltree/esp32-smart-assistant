@@ -6,23 +6,23 @@ This project is a **real-time smart voice assistant** running on ESP32-S3-EYE v2
 The ESP32 acts as a **low-power edge streaming device**, responsible for:
 - Live microphone audio streaming (NOT record-and-send)
 - Camera snapshot capture (optional)
-- WiFi communication with backend
+- WiFi communication with the AI engine
 - Audio playback response
 - LCD facial expression + status display
 - Simple control logic (wake trigger, VAD, button)
 
-All AI processing is handled externally by a **xiaozhi backend**
-(https://github.com/78/xiaozhi-esp32 — official xiaozhi.me cloud or a
-self-hosted xiaozhi-esp32-server):
-- Speech-to-Text (STT, server-side VAD/endpointing)
-- Large Language Model (LLM)
-- Text-to-Speech (TTS)
+All AI processing happens in the cloud: the firmware connects **directly to
+the selected AI engine's realtime voice API** over one WebSocket — there is
+no middle backend to host:
+- **Gemini Live API** (`AI_ENGINE_GEMINI`, default) — `src/GeminiLive.cpp`
+- **OpenAI Realtime API** (`AI_ENGINE_OPENAI`) — `src/OpenAiRealtime.cpp`
 
-The firmware implements the xiaozhi WebSocket protocol v1 (Opus audio both
-directions, hello handshake, listen/abort/tts/llm/stt JSON messages) in
-`src/XiaozhiProtocol.cpp`, plus the first-boot OTA/activation flow
-(`src/XiaozhiOta.cpp` — activation code shown on the LCD, entered at
-xiaozhi.me). Protocol details: `README.md` + xiaozhi's `docs/websocket.md`.
+The engine is chosen with `AI_ENGINE` in `include/secrets.h` (API keys live
+there too); both clients implement the common interface in
+`include/AiEngine.h`. The provider runs VAD/endpointing + STT + LLM + TTS
+server-side. Audio is raw mono 16-bit PCM both directions (base64 inside
+JSON WebSocket messages) — no Opus/codec anywhere. Protocol details:
+`README.md` "Wire protocol".
 
 ---
 
@@ -36,7 +36,7 @@ This project MUST support **live audio streaming over WebSocket**.
 - record audio → send file → wait response
 
 ✅ REQUIRED main flow:
-- continuous microphone stream → backend → real-time AI response
+- continuous microphone stream → AI engine → real-time AI response
 
 ### 2. Boot self-test BEFORE the main flow
 
@@ -44,7 +44,8 @@ On every boot the firmware MUST verify, with results shown on the LCD,
 **before** entering the main flow:
 - every pin/peripheral (PSRAM, LED, button, mic, camera; speaker is an
   intentional SKIP until an external amp is wired)
-- configuration (secrets.h filled in, WiFi actually connects, xiaozhi WS URL sane)
+- configuration (secrets.h filled in — WiFi credentials AND the selected
+  engine's API key — plus WiFi actually connects)
 
 Implemented in `src/SelfTest.cpp`. A FAIL continues in degraded mode but must
 be clearly visible (red row + red summary).
@@ -59,7 +60,10 @@ All user-facing information goes to the onboard LCD, and it must be
 - Plus state faces: neutral/cyan (idle), listening/azure, speaking/orange
 
 Implemented in `src/Display.cpp` (`displayShowFace`, `Expression` enum).
-The backend can push emotions via `{"type":"emotion","value":...}`.
+**The face is chosen by the model itself**: a `set_emotion(happy|sad|
+neutral|thinking)` tool is registered with the engine and the system prompt
+(`AI_SYSTEM_PROMPT` in `include/config.h`) tells the model to call it before
+every reply; `Conversation.cpp` maps the call to a face.
 
 ### 4. Pin changes require verification
 
@@ -75,12 +79,12 @@ verified on real hardware via the pin-check firmware + an explicit human
 ```
 [ESP32-S3-EYE v2.2]
    │
-   │ Continuous Opus Audio Stream (WebSocket, xiaozhi protocol v1)
+   │ Continuous PCM audio stream (base64 in JSON, WebSocket)
    ▼
-[xiaozhi backend — xiaozhi.me cloud or self-hosted]
+[AI engine — Gemini Live API or OpenAI Realtime API]
    ├── Streaming Speech-to-Text (server VAD + ASR)
-   ├── LLM processing (Qwen / DeepSeek / configurable)
-   ├── TTS generation (streaming Opus)
+   ├── LLM + set_emotion tool call (drives the LCD face)
+   ├── TTS generation (streaming 24 kHz PCM)
    ▼
 [ESP32 Response Layer]
    ├── Speaker playback (I2S, external amp)
@@ -89,8 +93,12 @@ verified on real hardware via the pin-check firmware + an explicit human
 ```
 
 State machine: `IDLE → LISTENING → THINKING → SPEAKING → LISTENING …`
-(continuous conversation until button press / server goodbye; see
+(continuous conversation until button press; see
 `include/AssistantState.h`; wire protocol in `README.md`).
+
+Uplink sample rate is engine-dependent (16 kHz Gemini / 24 kHz OpenAI —
+`AUDIO_SAMPLE_RATE` in `config.h` follows `AI_ENGINE`); downlink TTS is
+24 kHz for both.
 
 ---
 

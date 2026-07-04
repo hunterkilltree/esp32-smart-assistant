@@ -1,33 +1,34 @@
-// ESP32-S3-EYE smart assistant — xiaozhi-protocol firmware.
+// ESP32-S3-EYE smart assistant — direct-to-AI realtime voice firmware.
 //
-// Modeled on https://github.com/78/xiaozhi-esp32: continuous Opus audio
-// streaming over WebSocket to a xiaozhi backend (official xiaozhi.me cloud
-// or a self-hosted xiaozhi-esp32-server), which runs VAD + ASR + LLM + TTS
-// and streams Opus TTS audio back.
+// The device streams live mic PCM over one WebSocket straight to the
+// configured AI engine (Gemini Live API or OpenAI Realtime API — pick in
+// secrets.h), which runs VAD + ASR + LLM + TTS server-side and streams
+// spoken PCM audio back. A set_emotion tool call from the model drives the
+// face on the LCD (happy / sad / neutral / thinking).
 //
 // main.cpp is deliberately thin — just the boot sequence and the loop
 // pipeline. Each stage lives in its own module so it can be debugged alone:
 //   AppState        — state machine + face/LED feedback
 //   WifiLink        — WiFi reconnect/backoff + ArduinoOTA
-//   BackendSession  — OTA check → activation code → WebSocket connect
-//   XiaozhiProtocol — wire protocol (hello, listen/abort, tts/stt/llm)
-//   Conversation    — talk button, mic→server Opus pump, state timeouts
+//   BackendSession  — engine WebSocket bring-up
+//   AiEngine        — engine client (GeminiLive.cpp / OpenAiRealtime.cpp)
+//   Conversation    — talk button, mic→engine PCM pump, state timeouts
 //   Controls        — 4-button ADC ladder: PLAY=talk, UP/DN=volume, MENU=info
 //
 // Buttons: BOOT or PLAY = start / stop / barge-in a conversation,
 //          UP / DN = volume, MENU = info screen, RST = reset (hardwired).
 //
-// Boot flow:  splash → self-test → [activation code screen until the device
-// is bound at xiaozhi.me] → WebSocket hello → IDLE face.
-// Talk flow:  talk button → listen start (auto mode, server endpointing) →
-// STT text → THINKING → TTS start → SPEAKING (+ llm emotion faces) → TTS
-// stop → back to LISTENING (continuous conversation) until button/goodbye.
+// Boot flow:  splash → self-test → engine WebSocket setup → IDLE face.
+// Talk flow:  talk button → LISTENING (mic streams, server endpointing) →
+// THINKING → set_emotion tool call (face) → SPEAKING (TTS audio) → back to
+// LISTENING (continuous conversation) until the button ends it.
 #include <Arduino.h>
 #include <Adafruit_NeoPixel.h>
 #include <Bounce2.h>
 
 #include "config.h"
 #include "pins_config.h"
+#include "AiEngine.h"
 #include "AppState.h"
 #include "AudioCapture.h"
 #include "BackendSession.h"
@@ -37,7 +38,6 @@
 #include "Reliability.h"
 #include "SelfTest.h"
 #include "WifiLink.h"
-#include "XiaozhiProtocol.h"
 
 Adafruit_NeoPixel statusLed(1, PIN_RGB_LED, NEO_GRB + NEO_KHZ800);
 Bounce2::Button wakeButton;
@@ -60,7 +60,7 @@ void setup() {
   wakeButton.setPressedState(LOW);
 
   // Boot self-test: verifies pins, peripherals, and configuration (WiFi,
-  // WS endpoint) on the LCD before the main flow starts. Also performs the
+  // API key) on the LCD before the main flow starts. Also performs the
   // one-time audio/camera driver inits and the first WiFi connect.
   SelfTestReport report = selfTestRun(statusLed);
   if (report.failed > 0) {
@@ -78,11 +78,8 @@ void setup() {
   reliabilityInitWatchdog();
 
   appStateInit(&statusLed);
-  conversationInit();  // registers the xiaozhi protocol callbacks
+  conversationInit();  // registers the AI engine callbacks
   controlsInit();      // ADC buttons + saved volume
-
-  // From here on the mic PCM stream belongs to the Opus uplink.
-  audioCaptureEnableOpus(true);
 
   appShowFace(Expression::NEUTRAL, "Connecting...");
 }
@@ -101,8 +98,8 @@ void loop() {
   bool bootPressed = wakeButton.pressed();
   bool talkPressed = playPressed || bootPressed;
 
-  if (!backendSessionLoop(talkPressed)) return;  // still activating/connecting
+  if (!backendSessionLoop(talkPressed)) return;  // still connecting
 
-  xzLoop();                      // pump the WebSocket
+  aiEngineLoop();                // pump the WebSocket
   conversationLoop(talkPressed); // talk button, mic uplink, state timeouts
 }

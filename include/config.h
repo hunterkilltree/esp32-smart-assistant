@@ -1,5 +1,37 @@
 #pragma once
+#include <cstdint>
+
+// Engine ids — defined before secrets.h so AI_ENGINE can be set there.
+#define AI_ENGINE_GEMINI 1
+#define AI_ENGINE_OPENAI 2
+
 #include "secrets.h"
+
+#ifndef AI_ENGINE
+#define AI_ENGINE AI_ENGINE_GEMINI
+#endif
+
+// ---- AI engine (see include/AiEngine.h) ----
+// Models can be overridden in secrets.h if a newer one ships.
+#ifndef GEMINI_LIVE_MODEL
+#define GEMINI_LIVE_MODEL "models/gemini-3.1-flash-live-preview"
+#endif
+#ifndef OPENAI_REALTIME_MODEL
+#define OPENAI_REALTIME_MODEL "gpt-realtime"
+#endif
+#ifndef OPENAI_VOICE
+#define OPENAI_VOICE "marin"
+#endif
+
+// Shared system prompt: short spoken answers + the set_emotion tool call
+// that drives the LCD face (happy/sad/neutral/thinking).
+#define AI_SYSTEM_PROMPT                                                     \
+  "You are a cheerful voice assistant living inside a small robot that has " \
+  "a face display. This is a spoken conversation: answer in one or two "     \
+  "short sentences, no lists, no markdown. Before every reply, call the "    \
+  "set_emotion function with how your reply feels: happy for positive or "   \
+  "friendly answers, sad for errors, bad news, or when you cannot help, "    \
+  "neutral for plain factual answers."
 
 // ---- Timing ----
 constexpr unsigned long WIFI_RECONNECT_BASE_MS   = 2000;   // doubles per failed attempt
@@ -7,24 +39,21 @@ constexpr unsigned long WIFI_RECONNECT_MAX_MS    = 30000;  // backoff cap
 constexpr unsigned int  WIFI_RECONNECT_MAX_SHIFT = 5;      // caps 2000 << shift before min()
 constexpr unsigned long WS_RECONNECT_INTERVAL_MS = 5000;
 constexpr unsigned long BUTTON_DEBOUNCE_MS       = 25;
+constexpr unsigned long SETUP_TIMEOUT_MS         = 10000;  // session setup ack must arrive within this
 
-// ---- Audio (xiaozhi protocol: Opus both directions) ----
-// Uplink: mono 16-bit 16 kHz PCM from the mic, Opus-encoded in 60 ms frames.
-// Downlink: Opus frames at the sample rate announced in the server hello
-// (24 kHz on the official backend), decoded and written to I2S TX.
-constexpr uint32_t AUDIO_SAMPLE_RATE       = 16000;
-constexpr uint8_t  AUDIO_BITS_PER_SAMPLE   = 16;
-constexpr uint8_t  AUDIO_CHANNELS          = 1;
-constexpr uint32_t OPUS_FRAME_DURATION_MS  = 60;
-constexpr uint32_t PLAYBACK_SAMPLE_RATE_DEFAULT = 24000;
-// A 60 ms Opus frame at speech bitrates is well under 1 KB even in bad cases.
-constexpr size_t   OPUS_MAX_FRAME_BYTES    = 1500;
-
-// ---- xiaozhi protocol ----
-constexpr int           XIAOZHI_PROTOCOL_VERSION   = 1;
-constexpr unsigned long HELLO_TIMEOUT_MS           = 10000;  // server hello must arrive within this
-constexpr unsigned long OTA_CHECK_RETRY_MS         = 10000;  // re-poll while waiting for activation
-constexpr unsigned long OTA_CHECK_FAIL_RETRY_MS    = 30000;  // re-poll after an OTA check error
+// ---- Audio (raw PCM both directions — no codec) ----
+// Uplink: mono 16-bit PCM from the mic at the engine's required rate,
+// base64-encoded into the engine's JSON audio message.
+// Downlink: mono 16-bit PCM TTS at 24 kHz (both engines), written to I2S TX.
+#if AI_ENGINE == AI_ENGINE_OPENAI
+constexpr uint32_t AUDIO_SAMPLE_RATE = 24000;  // OpenAI Realtime pcm is 24 kHz
+#else
+constexpr uint32_t AUDIO_SAMPLE_RATE = 16000;  // Gemini Live input rate
+#endif
+constexpr uint8_t  AUDIO_BITS_PER_SAMPLE = 16;
+constexpr uint8_t  AUDIO_CHANNELS        = 1;
+constexpr uint32_t AUDIO_CHUNK_MS        = 60;   // one uplink message per chunk
+constexpr uint32_t PLAYBACK_SAMPLE_RATE  = 24000;
 
 // ---- Boot self-test (runs before the main flow; see SelfTest.h) ----
 // Screen pacing is deliberately slow so a human can actually read each
@@ -48,17 +77,17 @@ constexpr int ADC_BTN_PLAY_MIN_MV  = 1650, ADC_BTN_PLAY_MAX_MV  = 2200;
 constexpr int ADC_BTN_MENU_MIN_MV  = 2250, ADC_BTN_MENU_MAX_MV  = 2750;
 constexpr unsigned long ADC_BTN_POLL_MS = 15;  // 2 stable polls = a press
 
-// ---- Volume (UP/DN buttons, software gain on decoded TTS) ----
+// ---- Volume (UP/DN buttons, software gain on TTS playback) ----
 constexpr uint8_t VOLUME_DEFAULT = 70;   // percent, persisted in NVS
 constexpr uint8_t VOLUME_STEP    = 10;
 constexpr unsigned long VOLUME_OVERLAY_MS = 1500;  // bar hold before face returns
 
 // ---- State machine ----
-// Give up on THINKING (waiting for the backend's response) after this long
-// and return to IDLE, so a dead/absent backend can't wedge the device.
+// Give up on THINKING (waiting for the engine's response) after this long
+// and return to IDLE, so a dead connection can't wedge the device.
 constexpr unsigned long THINKING_TIMEOUT_MS = 15000;
 
-// ---- VAD (local signal-liveness only — the xiaozhi backend runs the real
-// VAD/endpointing server-side in "auto" listen mode) ----
+// ---- VAD (local signal-liveness only — both engines run the real
+// VAD/endpointing server-side on the streamed audio) ----
 constexpr float         VAD_RMS_THRESHOLD      = 500.0f;
 constexpr unsigned long VAD_SILENCE_TIMEOUT_MS = 1200;

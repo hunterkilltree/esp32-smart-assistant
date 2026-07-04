@@ -6,6 +6,7 @@
 
 #include "config.h"
 #include "pins_config.h"
+#include "AiEngine.h"
 #include "Display.h"
 #include "AudioCapture.h"
 #include "AudioPlayback.h"
@@ -14,8 +15,15 @@
 namespace {
 
 // Template values from secrets.h.example — if these are still in secrets.h,
-// the user never filled in real credentials/endpoints.
+// the user never filled in real credentials/keys.
 constexpr char PLACEHOLDER_SSID[] = "your-wifi-ssid";
+#if AI_ENGINE == AI_ENGINE_OPENAI
+constexpr char PLACEHOLDER_KEY[] = "your-openai-api-key";
+#define AI_API_KEY OPENAI_API_KEY
+#else
+constexpr char PLACEHOLDER_KEY[] = "your-gemini-api-key";
+#define AI_API_KEY GEMINI_API_KEY
+#endif
 
 size_t lastSnapshotBytes = 0;
 
@@ -93,14 +101,16 @@ void testConfig(SelfTestReport &report) {
   displayBootStep("CONFIG");
   bool ssidPlaceholder = (strcmp(WIFI_SSID, PLACEHOLDER_SSID) == 0) ||
                          (strlen(WIFI_SSID) == 0);
-  bool wsUrlBad = (strncmp(XIAOZHI_WS_URL, "ws", 2) != 0);
+  bool keyPlaceholder = (strcmp(AI_API_KEY, PLACEHOLDER_KEY) == 0) ||
+                        (strlen(AI_API_KEY) == 0);
 
   if (ssidPlaceholder) {
     Serial.println("[SelfTest] CONFIG: WIFI_SSID is still the template placeholder");
     record(report, TestStatus::FAIL, "secrets.h: WiFi not set");
-  } else if (wsUrlBad) {
-    Serial.println("[SelfTest] CONFIG: XIAOZHI_WS_URL is not a ws:// or wss:// URL");
-    record(report, TestStatus::WARN, "secrets.h: WS URL not set");
+  } else if (keyPlaceholder) {
+    Serial.printf("[SelfTest] CONFIG: %s API key is still the template placeholder\n",
+                  aiEngineName());
+    record(report, TestStatus::FAIL, "secrets.h: AI key not set");
   } else {
     Serial.println("[SelfTest] CONFIG: secrets.h looks filled in");
     record(report, TestStatus::PASS, "secrets.h filled in");
@@ -242,7 +252,7 @@ SelfTestReport selfTestRun(Adafruit_NeoPixel &led) {
     snprintf(info1, sizeof(info1), "WiFi: offline");
   }
   char info2[48];
-  snprintf(info2, sizeof(info2), "WS: %.42s", XIAOZHI_WS_URL);
+  snprintf(info2, sizeof(info2), "AI: %s", aiEngineName());
   displayBootSummary(report.passed, report.warned, report.failed, info1, info2);
 
   // Hold the summary until the wake button is pressed or the timeout ends,

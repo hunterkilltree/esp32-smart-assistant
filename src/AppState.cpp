@@ -3,8 +3,8 @@
 #include <Arduino.h>
 #include <WiFi.h>
 
+#include "AiEngine.h"
 #include "AudioCapture.h"
-#include "XiaozhiProtocol.h"
 
 namespace {
 
@@ -20,7 +20,7 @@ void appStateInit(Adafruit_NeoPixel *led) {
 
 void appShowFace(Expression expr, const char *statusText) {
   displayShowFace(expr, statusText);
-  //displayShowConnectivity(WiFi.status() == WL_CONNECTED, xzSocketConnected());
+  displayShowConnectivity(WiFi.status() == WL_CONNECTED, aiEngineSocketConnected());
 }
 
 void appRepaintFace() {

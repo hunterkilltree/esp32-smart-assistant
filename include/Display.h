@@ -55,11 +55,6 @@ void displayShowFace(Expression expr, const char *statusText);
 // (green = up, red = down). Cheap to call on every change.
 void displayShowConnectivity(bool wifiOk, bool wsOk);
 
-// First-boot binding screen: the 6-digit xiaozhi.me activation code, big
-// and readable, with instructions. Shown until the backend reports the
-// device as bound.
-void displayShowActivation(const char *code);
-
 // Volume overlay: a horizontal bar + percentage over the bottom of the
 // current screen (UP/DN buttons). The face repaints over it afterwards.
 void displayShowVolume(uint8_t percent);

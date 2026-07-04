@@ -5,7 +5,6 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/ringbuf.h>
-#include <opus.h>
 
 #include "config.h"
 #include "pins_config.h"
@@ -21,62 +20,20 @@
 
 namespace {
 
-constexpr size_t PLAYBACK_RINGBUF_BYTES     = 32 * 1024;
+// 64 KB buffers ~0.7s of 24 kHz PCM. The engines stream TTS slightly
+// faster than realtime, so bursts beyond this are dropped with a log —
+// bump this (or move the buffer to PSRAM) if drops show up once an amp
+// is actually wired.
+constexpr size_t PLAYBACK_RINGBUF_BYTES     = 64 * 1024;
+constexpr size_t PLAYBACK_ITEM_MAX_BYTES    = 2048;
 constexpr TickType_t PLAYBACK_WRITE_TIMEOUT = pdMS_TO_TICKS(20);
 
-// Ring buffer items: small header + payload, so Opus frames (main flow) and
-// raw PCM (pin-check tone test) can share one queue.
-enum : uint8_t { ITEM_PCM = 0, ITEM_OPUS = 1 };
-struct __attribute__((packed)) ItemHeader {
-  uint8_t kind;
-  uint16_t len;
-};
-
 RingbufHandle_t s_ringBuf = nullptr;
-OpusDecoder *s_decoder = nullptr;
-volatile uint32_t s_pendingRate = AUDIO_SAMPLE_RATE;
-uint32_t s_currentRate = AUDIO_SAMPLE_RATE;
 volatile bool s_clearRequested = false;
 volatile uint8_t s_volume = VOLUME_DEFAULT;  // percent
 
-// Decoded PCM scratch: 120ms at 24kHz of headroom over the expected 60ms.
-constexpr int DECODE_MAX_SAMPLES = 2880;
-
-void enqueueItem(uint8_t kind, const uint8_t *data, size_t len) {
-  if (s_ringBuf == nullptr || len == 0) return;
-  static uint8_t tmp[sizeof(ItemHeader) + OPUS_MAX_FRAME_BYTES];
-  if (len > OPUS_MAX_FRAME_BYTES) {
-    Serial.printf("[Playback] item too large (%u bytes), dropped\n", (unsigned)len);
-    return;
-  }
-  ItemHeader hdr = {kind, (uint16_t)len};
-  memcpy(tmp, &hdr, sizeof(hdr));
-  memcpy(tmp + sizeof(hdr), data, len);
-  if (xRingbufferSend(s_ringBuf, tmp, sizeof(hdr) + len, PLAYBACK_WRITE_TIMEOUT) != pdTRUE) {
-    Serial.println("[Playback] Ring buffer full, dropped audio frame");
-  }
-}
-
-// Decode also runs in its own task: libopus needs ~25KB of stack.
 void playbackTask(void *) {
-#if HAS_SPEAKER
-  static int16_t pcm[DECODE_MAX_SAMPLES];
-#endif
-
   for (;;) {
-#if HAS_SPEAKER
-    // Apply a server-announced sample rate change between frames.
-    if (s_pendingRate != s_currentRate) {
-      s_currentRate = s_pendingRate;
-      i2s_set_sample_rates(I2S_NUM_0, s_currentRate);
-      if (s_decoder != nullptr) {
-        opus_decoder_destroy(s_decoder);
-        s_decoder = nullptr;
-      }
-      Serial.printf("[Playback] sample rate -> %u\n", (unsigned)s_currentRate);
-    }
-#endif
-
     size_t itemLen = 0;
     void *item = xRingbufferReceive(s_ringBuf, &itemLen, pdMS_TO_TICKS(100));
     if (item == nullptr) continue;
@@ -101,38 +58,16 @@ void playbackTask(void *) {
       continue;
     }
 
-    auto *hdr = reinterpret_cast<ItemHeader *>(item);
-    uint8_t *payload = reinterpret_cast<uint8_t *>(item) + sizeof(ItemHeader);
-    size_t bytesWritten = 0;
-
-    if (hdr->kind == ITEM_PCM) {
-      i2s_write(I2S_NUM_0, payload, hdr->len, &bytesWritten, portMAX_DELAY);
-    } else {
-      if (s_decoder == nullptr) {
-        int err = 0;
-        s_decoder = opus_decoder_create(s_currentRate, AUDIO_CHANNELS, &err);
-        if (err != OPUS_OK || s_decoder == nullptr) {
-          Serial.printf("[Opus] decoder create failed: %d\n", err);
-          s_decoder = nullptr;
-          vRingbufferReturnItem(s_ringBuf, item);
-          continue;
-        }
-      }
-      int samples = opus_decode(s_decoder, payload, hdr->len, pcm,
-                                DECODE_MAX_SAMPLES, 0);
-      if (samples > 0) {
-        uint8_t vol = s_volume;
-        if (vol != 100) {
-          for (int i = 0; i < samples; i++) {
-            pcm[i] = (int16_t)(((int32_t)pcm[i] * vol) / 100);
-          }
-        }
-        i2s_write(I2S_NUM_0, pcm, (size_t)samples * sizeof(int16_t),
-                  &bytesWritten, portMAX_DELAY);
-      } else {
-        Serial.printf("[Opus] decode failed: %d\n", samples);
+    auto *samples = reinterpret_cast<int16_t *>(item);
+    size_t count = itemLen / sizeof(int16_t);
+    uint8_t vol = s_volume;
+    if (vol != 100) {
+      for (size_t i = 0; i < count; i++) {
+        samples[i] = (int16_t)(((int32_t)samples[i] * vol) / 100);
       }
     }
+    size_t bytesWritten = 0;
+    i2s_write(I2S_NUM_0, samples, itemLen, &bytesWritten, portMAX_DELAY);
     vRingbufferReturnItem(s_ringBuf, item);
 #endif  // HAS_SPEAKER
   }
@@ -153,7 +88,7 @@ void audioPlaybackInit() {
 #else
   i2s_config_t i2sConfig = {
       .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
-      .sample_rate = AUDIO_SAMPLE_RATE,
+      .sample_rate = PLAYBACK_SAMPLE_RATE,
       .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
       .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
       .communication_format = I2S_COMM_FORMAT_STAND_I2S,
@@ -176,22 +111,18 @@ void audioPlaybackInit() {
   i2s_set_pin(I2S_NUM_0, &pinConfig);
 #endif  // HAS_SPEAKER
 
-  xTaskCreatePinnedToCore(playbackTask, "audio_playback", 32768, nullptr, 5, nullptr, 1);
-}
-
-void audioPlaybackConfigure(uint32_t sampleRate) {
-  s_pendingRate = sampleRate;
-}
-
-void audioPlaybackWriteOpus(const uint8_t *data, size_t len) {
-  enqueueItem(ITEM_OPUS, data, len);
+  xTaskCreatePinnedToCore(playbackTask, "audio_playback", 8192, nullptr, 5, nullptr, 1);
 }
 
 void audioPlaybackWrite(const uint8_t *data, size_t len) {
-  // Raw PCM can exceed the per-item cap; split it.
+  if (s_ringBuf == nullptr) return;
+  // Split into ring items the playback task consumes one at a time.
   while (len > 0) {
-    size_t chunk = len > OPUS_MAX_FRAME_BYTES ? OPUS_MAX_FRAME_BYTES : len;
-    enqueueItem(ITEM_PCM, data, chunk);
+    size_t chunk = len > PLAYBACK_ITEM_MAX_BYTES ? PLAYBACK_ITEM_MAX_BYTES : len;
+    if (xRingbufferSend(s_ringBuf, data, chunk, PLAYBACK_WRITE_TIMEOUT) != pdTRUE) {
+      Serial.println("[Playback] Ring buffer full, dropped audio");
+      return;
+    }
     data += chunk;
     len -= chunk;
   }

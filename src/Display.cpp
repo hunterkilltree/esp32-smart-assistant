@@ -290,24 +290,6 @@ void displayShowConnectivity(bool wifiOk, bool wsOk) {
   tft.fillCircle(224, 12, 5, wsOk ? COL_GREEN : COL_RED);
 }
 
-void displayShowActivation(const char *code) {
-  ensureBacklight();
-  tft.fillScreen(COL_BG);
-  tft.fillRect(0, 0, W, 26, COL_MAGENTA);
-  printCentered("ACTIVATE", 6, 2, COL_BG);
-
-  printCentered("Visit xiaozhi.me", 44, 2, COL_TEXT);
-  printCentered("Console > Add Device", 70, 1, COL_MUTED);
-  printCentered("and enter this code:", 84, 1, COL_MUTED);
-
-  // 6 digits at size 5 are 180px wide — fills the screen nicely.
-  printCentered(code, 116, 5, COL_GREEN);
-
-  printCentered("checking again soon...", 186, 1, COL_MUTED);
-  printCentered("BOOT btn = check now", 200, 1, COL_MUTED);
-  drawRainbowStrip(H - 8, 8);
-}
-
 void displayShowVolume(uint8_t percent) {
   if (percent > 100) percent = 100;
   // Overlay strip across the bottom; the next face redraw wipes it.
