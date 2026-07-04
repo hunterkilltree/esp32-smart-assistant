@@ -52,14 +52,7 @@ void toggleInfoScreen() {
   }
 
   char l1[40], l2[40], l3[40], l4[40], l5[40], l6[40], l7[40];
-  const char *stateName;
-  switch (appStateGet()) {
-    case AssistantState::LISTENING: stateName = "LISTENING"; break;
-    case AssistantState::THINKING:  stateName = "THINKING";  break;
-    case AssistantState::SPEAKING:  stateName = "SPEAKING";  break;
-    default:                        stateName = "IDLE";      break;
-  }
-  snprintf(l1, sizeof(l1), "State: %s", stateName);
+  snprintf(l1, sizeof(l1), "State: %s", appStateName(appStateGet()));
   snprintf(l2, sizeof(l2), "WiFi: %s (%d dBm)",
            WiFi.status() == WL_CONNECTED ? WiFi.SSID().c_str() : "offline",
            (int)WiFi.RSSI());

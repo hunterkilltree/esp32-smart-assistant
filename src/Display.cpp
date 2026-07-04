@@ -52,6 +52,35 @@ void printCentered(const char *s, int16_t y, uint8_t size, uint16_t color) {
   tft.print(s);
 }
 
+// Word-wraps `s` into up to maxLines centered lines starting at y. Breaks
+// at spaces when possible; the last line gets a ".." tail if text is cut.
+void printWrappedCentered(const char *s, int16_t y, int maxLines,
+                          uint8_t size, uint16_t color) {
+  const int perLine = (W - 6) / (6 * size);  // chars that fit one line
+  const int16_t lineH = 8 * size + 4;
+  char line[41];
+  const char *p = s;
+  for (int lineNo = 0; lineNo < maxLines && *p; lineNo++) {
+    while (*p == ' ') p++;
+    int len = (int)strlen(p);
+    int take = len < perLine ? len : perLine;
+    if (len > perLine) {  // try to break at the last space that fits
+      int brk = take;
+      while (brk > 0 && p[brk] != ' ') brk--;
+      if (brk > 0) take = brk;
+    }
+    if (take > (int)sizeof(line) - 1) take = sizeof(line) - 1;
+    memcpy(line, p, take);
+    line[take] = '\0';
+    p += take;
+    while (*p == ' ') p++;
+    if (*p && lineNo == maxLines - 1 && take >= 2) {  // cut off — mark it
+      line[take - 2] = line[take - 1] = '.';
+    }
+    printCentered(line, y + lineNo * lineH, size, color);
+  }
+}
+
 void drawRainbowStrip(int16_t y, int16_t h) {
   static const uint16_t rainbow[6] = {COL_RED, COL_ORANGE, COL_YELLOW,
                                       COL_GREEN, COL_CYAN, COL_MAGENTA};
@@ -262,7 +291,8 @@ void displayBootSummary(int passed, int warned, int failed,
   printCentered("BOOT btn or wait to continue", 226, 1, COL_MUTED);
 }
 
-void displayShowFace(Expression expr, const char *statusText) {
+void displayShowFace(Expression expr, const char *statusText,
+                     const char *caption) {
   const uint16_t accent = expressionColor(expr);
 
   ensureBacklight();
@@ -273,9 +303,16 @@ void displayShowFace(Expression expr, const char *statusText) {
   tft.setCursor(8, 4);
   tft.print("ASSISTANT");
 
-  drawFace(W / 2, 130, 72, expr);
-
-  printCentered(statusText, 216, 2, accent);
+  if (caption && caption[0]) {
+    // Smaller face up top, the model's caption wrapped underneath, and the
+    // state text demoted to a small footer.
+    drawFace(W / 2, 92, 52, expr);
+    printWrappedCentered(caption, 158, 3, 2, COL_TEXT);
+    printCentered(statusText, 226, 1, accent);
+  } else {
+    drawFace(W / 2, 130, 72, expr);
+    printCentered(statusText, 216, 2, accent);
+  }
 }
 
 void displayShowConnectivity(bool wifiOk, bool wsOk) {

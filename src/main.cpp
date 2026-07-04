@@ -20,8 +20,9 @@
 //
 // Boot flow:  splash → self-test → engine WebSocket setup → IDLE face.
 // Talk flow:  talk button → LISTENING (mic streams, server endpointing) →
-// THINKING → set_emotion tool call (face) → SPEAKING (TTS audio) → back to
-// LISTENING (continuous conversation) until the button ends it.
+// THINKING → set_emotion tool call (face + caption) → SPEAKING (TTS audio)
+// → RESULT: the reply's face + caption stay on screen until the talk
+// button starts the next round (back to LISTENING).
 #include <Arduino.h>
 #include <Adafruit_NeoPixel.h>
 #include <Bounce2.h>

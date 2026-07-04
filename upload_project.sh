@@ -17,7 +17,7 @@
 #
 # Examples:
 #   ./upload_project.sh                  # build + upload, auto-detect port
-#   ./upload_project.sh -p COM5 -m       # upload to COM5, then open the monitor
+#   ./upload_project.sh -p COM3 -m       # upload to COM5, then open the monitor
 #   ./upload_project.sh -b               # just build, don't touch the board
 #   ./upload_project.sh --pincheck -p COM5   # flash + watch the pin-check firmware
 

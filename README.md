@@ -13,9 +13,11 @@ one WebSocket — no middle backend to run. Pick the engine in `secrets.h`:
 
 Live microphone PCM streams up; the provider runs VAD + ASR + LLM + TTS
 server-side and streams spoken PCM audio back. The model is given a
-`set_emotion` tool and calls it before every reply — that tool call picks the
-face (smile / sad / neutral) shown on the LCD. All heavy AI work happens in
-the cloud, never on the device.
+`set_emotion(emotion, text)` tool and calls it before every reply — that tool
+call picks the face (smile / sad / neutral) shown on the LCD **and** puts a
+short caption of the reply (max ~6 words, in the reply's language) under the
+face for the whole spoken turn. All heavy AI work happens in the cloud, never
+on the device.
 
 ```
 [ESP32-S3-EYE v2.2]
@@ -24,7 +26,7 @@ the cloud, never on the device.
    ▼
 [AI engine]  (Gemini Live API  or  OpenAI Realtime API)
    ├── Server-side VAD + streaming ASR
-   ├── LLM + set_emotion tool call  ──►  LCD face (happy/sad/neutral)
+   ├── LLM + set_emotion tool call  ──►  LCD face + short caption text
    ├── Streaming TTS (24 kHz PCM)
    ▼
 [ESP32 Response Layer]
@@ -40,18 +42,22 @@ the cloud, never on the device.
   Record-then-send is explicitly *not* the main flow.
 - **No backend to host** — the device talks straight to the provider; the
   only setup is pasting an API key into `secrets.h`.
-- **Model-driven emotions** — a `set_emotion(happy|sad|neutral|thinking)`
-  function is registered with the engine; the system prompt tells the model
-  to call it before every reply, and the firmware maps the call to the face.
+- **Model-driven emotions + on-screen text** — a `set_emotion(emotion,
+  text)` function (emotion: happy|sad|neutral|thinking) is registered with
+  the engine; the system prompt tells the model to call it before every
+  reply. The firmware maps the call to the face and word-wraps the short
+  `text` caption under it, keeping both on screen while the reply plays
+  (e.g. a sad message shows the red sad face plus a short sorry text).
 - **Boot self-test** — every pin, peripheral, and configuration value
   (WiFi, API key) is verified **before the main flow starts**, with results
   shown on the LCD as a colored PASS / WARN / FAIL / SKIP checklist plus a
   summary screen.
 - **Expressive LCD face** — assistant states and model emotions are drawn
   as colorful faces, with a status bar and live WiFi/WebSocket dots.
-- **Continuous conversation** — one button press opens a session; after
-  each spoken reply the mic reopens automatically until you press the
-  button again. A press during a reply barges in.
+- **Push-to-talk rounds with a held result** — one button press opens the
+  mic for one exchange; when the reply finishes, its face + caption stay
+  on screen so you can read them at your own pace. Press the button again
+  to talk again (a press during a reply aborts it).
 - **Reliability** — WiFi reconnect with exponential backoff, WS
   auto-reconnect + session re-setup, ArduinoOTA updates, task watchdog.
 
@@ -87,18 +93,20 @@ Presses that match no window are logged with their measured mV.
 
 ## State machine
 
-`IDLE → LISTENING → THINKING → SPEAKING → LISTENING (continuous) → … → IDLE`
+`IDLE → LISTENING → THINKING → SPEAKING → RESULT (response held) → LISTENING → …`
 
-- **BOOT button** in `IDLE` starts a conversation — the mic streams
-  continuously and the engine does the endpointing server-side (no
-  on-device wake word, see `PROGRESS.md`).
+- **BOOT button** in `IDLE` starts a round — the mic streams continuously
+  and the engine does the endpointing server-side (no on-device wake word,
+  see `PROGRESS.md`).
 - `LISTENING → THINKING` when the engine reports the utterance ended
   (OpenAI `speech_stopped`; Gemini has no explicit event, so the face jumps
   straight to the reply).
 - `THINKING → SPEAKING` on the first TTS audio chunk; the `set_emotion`
-  tool call lands just before it and sets the face.
-- `SPEAKING → LISTENING` when the turn completes while the conversation is
-  active.
+  tool call lands just before it and sets the face + caption, which stay
+  on screen until the turn ends (or is aborted/interrupted).
+- `SPEAKING → RESULT` when the turn completes — the reply's face + caption
+  stay on screen ("BOOT/PLAY = talk" footer), surviving WS reconnects,
+  until the next button press returns to `LISTENING`.
 - BOOT button during `LISTENING` stops; during `THINKING`/`SPEAKING` aborts.
 - `THINKING → IDLE` automatically after 15 s if the engine never answers.
 

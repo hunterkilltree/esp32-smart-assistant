@@ -13,9 +13,10 @@
 //             base64 inside JSON messages
 //   downlink — TTS PCM at PLAYBACK_SAMPLE_RATE (24 kHz both)
 //
-// The model is given a set_emotion(happy|sad|neutral|thinking) tool and a
+// The model is given a set_emotion(emotion, text) tool — emotion one of
+// happy|sad|neutral|thinking, text a short on-screen caption — and a
 // system prompt telling it to call the tool before every reply — that tool
-// call drives the face on the LCD (onEmotion).
+// call drives the face + caption on the LCD (onEmotion).
 //
 // All calls, including the callbacks, happen on the Arduino loop task.
 
@@ -32,8 +33,9 @@ struct AiEngineCallbacks {
   void (*onTurnComplete)();
   // The user barged in over the model's reply — discard queued playback.
   void (*onInterrupted)();
-  // set_emotion tool call: "happy" | "sad" | "neutral" | "thinking".
-  void (*onEmotion)(const char *emotion);
+  // set_emotion tool call: emotion is "happy" | "sad" | "neutral" |
+  // "thinking"; text is a short caption to show on the LCD (may be "").
+  void (*onEmotion)(const char *emotion, const char *text);
 };
 
 // Registers callbacks. Call once from setup(), before aiEngineConnect().

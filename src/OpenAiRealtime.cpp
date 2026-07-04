@@ -65,8 +65,8 @@ void sendSessionUpdate() {
   tool["type"] = "function";
   tool["name"] = "set_emotion";
   tool["description"] =
-      "Set the facial expression shown on the robot's screen. Call this "
-      "once before every spoken reply.";
+      "Set the facial expression and short caption shown on the robot's "
+      "screen. Call this once before every spoken reply.";
   JsonObject params = tool["parameters"].to<JsonObject>();
   params["type"] = "object";
   JsonObject emotion = params["properties"]["emotion"].to<JsonObject>();
@@ -76,7 +76,13 @@ void sendSessionUpdate() {
   allowed.add("sad");
   allowed.add("neutral");
   allowed.add("thinking");
+  JsonObject text = params["properties"]["text"].to<JsonObject>();
+  text["type"] = "string";
+  text["description"] =
+      "Very short caption of the reply shown on the screen (max 6 words, "
+      "same language as the spoken reply).";
   params["required"][0] = "emotion";
+  params["required"][1] = "text";
   session["tool_choice"] = "auto";
 
   sendJson(doc);
@@ -160,8 +166,9 @@ void handleServerEvent(uint8_t *payload, size_t length) {
       if (deserializeJson(args, doc["arguments"] | "") ==
           DeserializationError::Ok) {
         const char *emotion = args["emotion"] | "";
-        Serial.printf("[OpenAI] set_emotion(%s)\n", emotion);
-        if (emotion[0] && s_cbs.onEmotion) s_cbs.onEmotion(emotion);
+        const char *text = args["text"] | "";
+        Serial.printf("[OpenAI] set_emotion(%s, \"%s\")\n", emotion, text);
+        if (emotion[0] && s_cbs.onEmotion) s_cbs.onEmotion(emotion, text);
       }
     } else {
       Serial.printf("[OpenAI] Unknown tool call: %s\n", name);

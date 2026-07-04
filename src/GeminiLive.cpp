@@ -48,8 +48,8 @@ void sendSetup() {
       setup["tools"][0]["functionDeclarations"][0].to<JsonObject>();
   fn["name"] = "set_emotion";
   fn["description"] =
-      "Set the facial expression shown on the robot's screen. Call this "
-      "once before every spoken reply.";
+      "Set the facial expression and short caption shown on the robot's "
+      "screen. Call this once before every spoken reply.";
   JsonObject params = fn["parameters"].to<JsonObject>();
   params["type"] = "object";
   JsonObject emotion = params["properties"]["emotion"].to<JsonObject>();
@@ -59,7 +59,13 @@ void sendSetup() {
   allowed.add("sad");
   allowed.add("neutral");
   allowed.add("thinking");
+  JsonObject text = params["properties"]["text"].to<JsonObject>();
+  text["type"] = "string";
+  text["description"] =
+      "Very short caption of the reply shown on the screen (max 6 words, "
+      "same language as the spoken reply).";
   params["required"][0] = "emotion";
+  params["required"][1] = "text";
 
   String out;
   serializeJson(doc, out);
@@ -128,8 +134,9 @@ void handleServerMessage(uint8_t *payload, size_t length) {
       const char *id = call["id"] | "";
       if (strcmp(name, "set_emotion") == 0) {
         const char *emotion = call["args"]["emotion"] | "";
-        Serial.printf("[Gemini] set_emotion(%s)\n", emotion);
-        if (emotion[0] && s_cbs.onEmotion) s_cbs.onEmotion(emotion);
+        const char *text = call["args"]["text"] | "";
+        Serial.printf("[Gemini] set_emotion(%s, \"%s\")\n", emotion, text);
+        if (emotion[0] && s_cbs.onEmotion) s_cbs.onEmotion(emotion, text);
       } else {
         Serial.printf("[Gemini] Unknown tool call: %s\n", name);
       }

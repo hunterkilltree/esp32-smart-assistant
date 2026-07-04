@@ -47,9 +47,13 @@ void displayBootSummary(int passed, int warned, int failed,
                         const char *info1, const char *info2);
 
 // ---- Main-flow face screen ----
-// Full-screen redraw: top status bar (state text), big face, caption.
+// Full-screen redraw: top status bar, big face, status text. When `caption`
+// is non-empty (the model's on-screen text from set_emotion) the face
+// shrinks and the caption is word-wrapped below it, with the status text
+// demoted to a small footer line.
 // Call displayShowConnectivity() afterwards to restore the WiFi/WS dots.
-void displayShowFace(Expression expr, const char *statusText);
+void displayShowFace(Expression expr, const char *statusText,
+                     const char *caption = nullptr);
 
 // Two small dots in the top-right corner: WiFi and WebSocket link state
 // (green = up, red = down). Cheap to call on every change.

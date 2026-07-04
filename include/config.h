@@ -1,4 +1,5 @@
 #pragma once
+#include <cstddef>
 #include <cstdint>
 
 // Engine ids — defined before secrets.h so AI_ENGINE can be set there.
@@ -24,14 +25,20 @@
 #endif
 
 // Shared system prompt: short spoken answers + the set_emotion tool call
-// that drives the LCD face (happy/sad/neutral/thinking).
+// that drives the LCD face (happy/sad/neutral/thinking) and puts a short
+// caption of the reply on the screen.
 #define AI_SYSTEM_PROMPT                                                     \
   "You are a cheerful voice assistant living inside a small robot that has " \
   "a face display. This is a spoken conversation: answer in one or two "     \
   "short sentences, no lists, no markdown. Before every reply, call the "    \
-  "set_emotion function with how your reply feels: happy for positive or "   \
-  "friendly answers, sad for errors, bad news, or when you cannot help, "    \
-  "neutral for plain factual answers."
+  "set_emotion function with two arguments: emotion — how your reply "      \
+  "feels (happy for positive or friendly answers, sad for errors, bad "     \
+  "news, or when you cannot help, neutral for plain factual answers) — "    \
+  "and text — a very short caption of your reply to show on the screen, "   \
+  "at most 6 words, in the same language you answer in."
+
+// Longest on-screen caption kept from a set_emotion call (bytes, incl. NUL).
+constexpr size_t EMOTION_TEXT_MAX = 64;
 
 // ---- Timing ----
 constexpr unsigned long WIFI_RECONNECT_BASE_MS   = 2000;   // doubles per failed attempt

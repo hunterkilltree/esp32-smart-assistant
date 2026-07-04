@@ -60,10 +60,13 @@ All user-facing information goes to the onboard LCD, and it must be
 - Plus state faces: neutral/cyan (idle), listening/azure, speaking/orange
 
 Implemented in `src/Display.cpp` (`displayShowFace`, `Expression` enum).
-**The face is chosen by the model itself**: a `set_emotion(happy|sad|
-neutral|thinking)` tool is registered with the engine and the system prompt
-(`AI_SYSTEM_PROMPT` in `include/config.h`) tells the model to call it before
-every reply; `Conversation.cpp` maps the call to a face.
+**The face and on-screen text are chosen by the model itself**: a
+`set_emotion(emotion, text)` tool (emotion: happy|sad|neutral|thinking;
+text: short caption of the reply, max ~6 words, in the reply's language) is
+registered with the engine and the system prompt (`AI_SYSTEM_PROMPT` in
+`include/config.h`) tells the model to call it before every reply;
+`Conversation.cpp` maps the call to a face + caption which stay on screen
+for the whole spoken turn (`appSetTurnFace` in `AppState.cpp`).
 
 ### 4. Pin changes require verification
 
@@ -92,8 +95,9 @@ verified on real hardware via the pin-check firmware + an explicit human
    └── Optional camera snapshot
 ```
 
-State machine: `IDLE → LISTENING → THINKING → SPEAKING → LISTENING …`
-(continuous conversation until button press; see
+State machine: `IDLE → LISTENING → THINKING → SPEAKING → RESULT →
+LISTENING …` — the RESULT state holds the reply's face + caption on screen
+until the talk button starts the next round (see
 `include/AssistantState.h`; wire protocol in `README.md`).
 
 Uplink sample rate is engine-dependent (16 kHz Gemini / 24 kHz OpenAI —
