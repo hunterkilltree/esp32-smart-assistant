@@ -49,7 +49,9 @@ void sendSessionUpdate() {
   doc["type"] = "session.update";
   JsonObject session = doc["session"].to<JsonObject>();
   session["type"] = "realtime";
-  session["output_modalities"][0] = "audio";
+  // TEXT-only replies — a LAN server speaks them (SpeakServer.h); the
+  // board has no speaker and skipping TTS keeps the socket healthy.
+  session["output_modalities"][0] = "text";
   session["instructions"] = AI_SYSTEM_PROMPT;
 
   JsonObject input = session["audio"]["input"].to<JsonObject>();
@@ -158,8 +160,8 @@ void handleServerEvent(uint8_t *payload, size_t length) {
              strcmp(type, "response.audio.delta") == 0) {  // legacy name
     const char *b64 = doc["delta"] | "";
     if (b64[0]) emitBase64Audio(b64);
-  } else if (strcmp(type, "response.output_audio_transcript.delta") == 0 ||
-             strcmp(type, "response.audio_transcript.delta") == 0) {  // legacy
+  } else if (strcmp(type, "response.output_text.delta") == 0 ||
+             strcmp(type, "response.text.delta") == 0) {  // legacy name
     const char *transcript = doc["delta"] | "";
     if (transcript[0] && s_cbs.onTranscript) s_cbs.onTranscript(transcript);
   } else if (strcmp(type, "input_audio_buffer.speech_started") == 0) {

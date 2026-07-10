@@ -49,7 +49,11 @@ constexpr size_t EMOTION_TEXT_MAX = 64;
 #ifndef SPEAK_SERVER_URL
 #define SPEAK_SERVER_URL "http://192.168.1.77:8080/speak"
 #endif
-constexpr unsigned long SPEAK_SERVER_TIMEOUT_MS = 3000;  // connect + read
+constexpr unsigned long SPEAK_SERVER_TIMEOUT_MS      = 3000;   // TCP connect
+// The server may only answer after it finishes speaking the text — allow it
+// plenty of time. Sends run on their own task, so this never blocks the
+// main loop / WebSocket pump.
+constexpr unsigned long SPEAK_SERVER_READ_TIMEOUT_MS = 20000;
 // Longest reply transcript kept per turn (bytes incl. NUL; extra is dropped).
 constexpr size_t TRANSCRIPT_MAX = 2048;
 // The POST is sent only after the transcript has settled — no new chunk for
@@ -110,6 +114,14 @@ constexpr unsigned long VOLUME_OVERLAY_MS = 1500;  // bar hold before face retur
 // Give up on THINKING (waiting for the engine's response) after this long
 // and return to IDLE, so a dead connection can't wedge the device.
 constexpr unsigned long THINKING_TIMEOUT_MS = 15000;
+
+// End a LISTENING round once the user has been silent (no frame above
+// VAD_RMS_THRESHOLD) for this long. WS drops do NOT end the round — only
+// user silence or this board's absolute backstop below.
+constexpr unsigned long LISTENING_SILENCE_TIMEOUT_MS = 15000;
+// Absolute cap on one LISTENING round — backstop for a mic whose noise
+// floor sits above the VAD threshold (would otherwise never look silent).
+constexpr unsigned long LISTENING_MAX_MS = 120000;
 
 // ---- VAD (local signal-liveness only — both engines run the real
 // VAD/endpointing server-side on the streamed audio) ----

@@ -15,6 +15,9 @@ namespace {
 QueueHandle_t s_pcmQueue = nullptr;
 volatile bool s_capturing = false;
 volatile bool s_silenceTimeoutHit = false;
+// Last frame whose RMS crossed the voice threshold. Kept at "now" while
+// not capturing, so ms-since-voice only grows during an active round.
+volatile unsigned long s_lastVoiceMs = 0;
 
 void captureTask(void *) {
   // 32-bit read + >>14 shift, matching espressif/esp-skainet's actual
@@ -25,12 +28,12 @@ void captureTask(void *) {
   // int16_t pipeline below.
   static int32_t raw[AUDIO_CHUNK_SAMPLES];
   static int16_t buf[AUDIO_CHUNK_SAMPLES];
-  unsigned long lastVoiceMs = millis();
+  s_lastVoiceMs = millis();
 
   for (;;) {
     if (!s_capturing) {
       vTaskDelay(pdMS_TO_TICKS(20));
-      lastVoiceMs = millis();
+      s_lastVoiceMs = millis();
       continue;
     }
 
@@ -52,9 +55,9 @@ void captureTask(void *) {
 
     unsigned long now = millis();
     if (rms > VAD_RMS_THRESHOLD) {
-      lastVoiceMs = now;
+      s_lastVoiceMs = now;
       s_silenceTimeoutHit = false;
-    } else if (now - lastVoiceMs > VAD_SILENCE_TIMEOUT_MS) {
+    } else if (now - s_lastVoiceMs > VAD_SILENCE_TIMEOUT_MS) {
       s_silenceTimeoutHit = true;
     }
 
@@ -116,4 +119,8 @@ bool audioCaptureDequeueChunk(uint8_t *outBuf) {
 
 bool audioCaptureSilenceTimeoutHit() {
   return s_silenceTimeoutHit;
+}
+
+unsigned long audioCaptureMsSinceVoice() {
+  return millis() - s_lastVoiceMs;
 }

@@ -30,3 +30,8 @@ bool audioCaptureDequeueChunk(uint8_t *outBuf);
 // configured timeout. Diagnostic only — endpointing is done server-side
 // by the AI engine on the streamed audio.
 bool audioCaptureSilenceTimeoutHit();
+
+// Milliseconds since the last frame whose RMS crossed VAD_RMS_THRESHOLD.
+// Pinned near 0 while capture is disabled — only grows during a round.
+// Used to end LISTENING after prolonged user silence.
+unsigned long audioCaptureMsSinceVoice();

@@ -30,6 +30,11 @@ bool s_socketConnected = false;
 bool s_ready = false;
 unsigned long s_setupSentAt = 0;
 
+// Latest session-resumption handle (sessionResumptionUpdate messages).
+// Presented in the next setup so a reconnect restores the conversation
+// instead of starting a cold session mid-call.
+char s_resumeHandle[128] = "";
+
 // Uplink message: 60 ms of 24 kHz PCM worst-case is 2880 B -> 3840 B of
 // base64, plus the JSON envelope. One static buffer, reused every chunk.
 char s_txBuf[6 * 1024];
@@ -41,10 +46,15 @@ void sendSetup() {
   JsonDocument doc;
   JsonObject setup = doc["setup"].to<JsonObject>();
   setup["model"] = GEMINI_LIVE_MODEL;
+  // This native-audio live model only accepts AUDIO response modality
+  // (a TEXT setup gets the session closed immediately). The board has no
+  // speaker, so the audio frames are discarded unread on arrival — the
+  // reply text comes from the transcription below plus the set_emotion
+  // speech argument, and a LAN server speaks it (SpeakServer.h).
   setup["generationConfig"]["responseModalities"][0] = "AUDIO";
   setup["systemInstruction"]["parts"][0]["text"] = AI_SYSTEM_PROMPT;
-  // Ask the server to also transcribe the model's spoken reply; the text
-  // arrives as serverContent.outputTranscription chunks (onTranscript).
+  // Transcript of the spoken reply — arrives as
+  // serverContent.outputTranscription chunks (onTranscript).
   setup["outputAudioTranscription"].to<JsonObject>();
 
   JsonObject fn =
@@ -76,6 +86,14 @@ void sendSetup() {
   params["required"][1] = "text";
   params["required"][2] = "speech";
 
+  // Ask for resumption handles; offer the last one so a reconnect picks
+  // the conversation back up where the dropped socket left it.
+  JsonObject resume = setup["sessionResumption"].to<JsonObject>();
+  if (s_resumeHandle[0]) {
+    resume["handle"] = s_resumeHandle;
+    Serial.println("[Gemini] Resuming previous session");
+  }
+
   String out;
   serializeJson(doc, out);
   // Serial.printf("[Gemini] -> setup (%s)\n", out.c_str());
@@ -97,8 +115,10 @@ void sendToolResponse(const char *id) {
 }
 
 // Decodes a base64 audio blob in slices (so arbitrarily large messages
-// never need one huge PCM buffer) and hands the PCM to onAudio.
+// never need one huge PCM buffer) and hands the PCM to onAudio. With no
+// onAudio consumer registered (no speaker wired), skips the decode.
 void emitBase64Audio(const char *b64) {
+  if (!s_cbs.onAudio) return;
   size_t remaining = strlen(b64);
   while (remaining >= 4) {
     // Largest 4-multiple slice whose decoded size fits the scratch buffer.
@@ -180,12 +200,27 @@ void handleServerMessage(uint8_t *payload, size_t length) {
     return;
   }
 
+  if (doc["sessionResumptionUpdate"].is<JsonObject>()) {
+    JsonObject update = doc["sessionResumptionUpdate"];
+    const char *handle = update["newHandle"] | "";
+    if ((update["resumable"] | false) && handle[0]) {
+      strlcpy(s_resumeHandle, handle, sizeof(s_resumeHandle));
+    }
+    return;
+  }
+
   if (doc["goAway"].is<JsonObject>()) {
     // Session lifetime limit — the server will close soon; the WebSockets
     // lib reconnects and setup re-runs (conversation context is lost).
     Serial.println("[Gemini] goAway — server is ending this session");
     return;
   }
+
+  // Anything else is unexpected — log it so a rejected setup or an error
+  // shows its reason instead of just a silent disconnect loop.
+  String unknown;
+  serializeJson(doc, unknown);
+  Serial.printf("[Gemini] Unhandled message: %.300s\n", unknown.c_str());
 }
 
 void onWsEvent(WStype_t type, uint8_t *payload, size_t length) {
@@ -200,6 +235,13 @@ void onWsEvent(WStype_t type, uint8_t *payload, size_t length) {
     case WStype_DISCONNECTED:
       if (s_socketConnected) {
         Serial.println("[Gemini] Socket disconnected");
+        if (!s_ready && s_resumeHandle[0]) {
+          // Died during setup — the offered resumption handle may be
+          // expired/rejected. Drop it so the retry starts a fresh session
+          // instead of looping on a poisoned handle.
+          Serial.println("[Gemini] Discarding resumption handle");
+          s_resumeHandle[0] = '\0';
+        }
         s_socketConnected = false;
         s_ready = false;
         if (s_cbs.onDisconnected) s_cbs.onDisconnected();
