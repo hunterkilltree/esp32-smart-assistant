@@ -31,14 +31,31 @@
   "You are a cheerful voice assistant living inside a small robot that has " \
   "a face display. This is a spoken conversation: answer in one or two "     \
   "short sentences, no lists, no markdown. Before every reply, call the "    \
-  "set_emotion function with two arguments: emotion — how your reply "      \
+  "set_emotion function with three arguments: emotion — how your reply "    \
   "feels (happy for positive or friendly answers, sad for errors, bad "     \
-  "news, or when you cannot help, neutral for plain factual answers) — "    \
-  "and text — a very short caption of your reply to show on the screen, "   \
-  "at most 6 words, in the same language you answer in."
+  "news, or when you cannot help, neutral for plain factual answers); "     \
+  "text — a very short caption of your reply to show on the screen, "       \
+  "at most 6 words, in the same language you answer in; and speech — the "  \
+  "complete text of the reply you are about to speak, word for word, in "   \
+  "the same language."
 
 // Longest on-screen caption kept from a set_emotion call (bytes, incl. NUL).
 constexpr size_t EMOTION_TEXT_MAX = 64;
+
+// ---- Speak server (reply-text relay) ----
+// After each spoken reply the full transcript is POSTed as plain text to
+// this LAN endpoint (see src/SpeakServer.cpp). Override in secrets.h, or
+// define it empty ("") there to disable the relay.
+#ifndef SPEAK_SERVER_URL
+#define SPEAK_SERVER_URL "http://192.168.1.77:8080/speak"
+#endif
+constexpr unsigned long SPEAK_SERVER_TIMEOUT_MS = 3000;  // connect + read
+// Longest reply transcript kept per turn (bytes incl. NUL; extra is dropped).
+constexpr size_t TRANSCRIPT_MAX = 2048;
+// The POST is sent only after the transcript has settled — no new chunk for
+// this long — so trailing chunks (which can arrive after turnComplete or a
+// mid-reply interrupt/WS-drop) are included in one complete message.
+constexpr unsigned long TRANSCRIPT_SETTLE_MS = 1000;
 
 // ---- Timing ----
 constexpr unsigned long WIFI_RECONNECT_BASE_MS   = 2000;   // doubles per failed attempt

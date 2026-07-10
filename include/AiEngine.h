@@ -36,6 +36,14 @@ struct AiEngineCallbacks {
   // set_emotion tool call: emotion is "happy" | "sad" | "neutral" |
   // "thinking"; text is a short caption to show on the LCD (may be "").
   void (*onEmotion)(const char *emotion, const char *text);
+  // The `speech` argument of the set_emotion tool call: the complete text
+  // of the reply the model is about to speak. Arrives once, at the START
+  // of the reply — the authoritative full text for the speak server.
+  void (*onReplyText)(const char *text);
+  // One chunk of the streamed transcript of the spoken reply (UTF-8,
+  // NUL-terminated, in order). Fallback source: chunks at the tail can be
+  // lost if the socket drops mid-reply.
+  void (*onTranscript)(const char *text);
 };
 
 // Registers callbacks. Call once from setup(), before aiEngineConnect().

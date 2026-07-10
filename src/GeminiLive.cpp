@@ -43,6 +43,9 @@ void sendSetup() {
   setup["model"] = GEMINI_LIVE_MODEL;
   setup["generationConfig"]["responseModalities"][0] = "AUDIO";
   setup["systemInstruction"]["parts"][0]["text"] = AI_SYSTEM_PROMPT;
+  // Ask the server to also transcribe the model's spoken reply; the text
+  // arrives as serverContent.outputTranscription chunks (onTranscript).
+  setup["outputAudioTranscription"].to<JsonObject>();
 
   JsonObject fn =
       setup["tools"][0]["functionDeclarations"][0].to<JsonObject>();
@@ -64,8 +67,14 @@ void sendSetup() {
   text["description"] =
       "Very short caption of the reply shown on the screen (max 6 words, "
       "same language as the spoken reply).";
+  JsonObject speech = params["properties"]["speech"].to<JsonObject>();
+  speech["type"] = "string";
+  speech["description"] =
+      "The complete text of the reply you are about to speak, word for "
+      "word, in the same language.";
   params["required"][0] = "emotion";
   params["required"][1] = "text";
+  params["required"][2] = "speech";
 
   String out;
   serializeJson(doc, out);
@@ -135,8 +144,12 @@ void handleServerMessage(uint8_t *payload, size_t length) {
       if (strcmp(name, "set_emotion") == 0) {
         const char *emotion = call["args"]["emotion"] | "";
         const char *text = call["args"]["text"] | "";
+        const char *speech = call["args"]["speech"] | "";
         Serial.printf("[Gemini] set_emotion(%s, \"%s\")\n", emotion, text);
+        Serial.printf("[Gemini] reply text (%u bytes): \"%s\"\n",
+                      (unsigned)strlen(speech), speech);
         if (emotion[0] && s_cbs.onEmotion) s_cbs.onEmotion(emotion, text);
+        if (speech[0] && s_cbs.onReplyText) s_cbs.onReplyText(speech);
       } else {
         Serial.printf("[Gemini] Unknown tool call: %s\n", name);
       }
@@ -154,6 +167,11 @@ void handleServerMessage(uint8_t *payload, size_t length) {
     for (JsonObject part : content["modelTurn"]["parts"].as<JsonArray>()) {
       const char *b64 = part["inlineData"]["data"] | "";
       if (b64[0]) emitBase64Audio(b64);
+    }
+    const char *transcript = content["outputTranscription"]["text"] | "";
+    if (transcript[0]) {
+      Serial.printf("[Gemini] transcript: \"%s\"\n", transcript);
+      if (s_cbs.onTranscript) s_cbs.onTranscript(transcript);
     }
     if (content["turnComplete"] | false) {
       Serial.println("[Gemini] Turn complete");

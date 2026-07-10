@@ -81,8 +81,14 @@ void sendSessionUpdate() {
   text["description"] =
       "Very short caption of the reply shown on the screen (max 6 words, "
       "same language as the spoken reply).";
+  JsonObject speech = params["properties"]["speech"].to<JsonObject>();
+  speech["type"] = "string";
+  speech["description"] =
+      "The complete text of the reply you are about to speak, word for "
+      "word, in the same language.";
   params["required"][0] = "emotion";
   params["required"][1] = "text";
+  params["required"][2] = "speech";
   session["tool_choice"] = "auto";
 
   sendJson(doc);
@@ -152,6 +158,10 @@ void handleServerEvent(uint8_t *payload, size_t length) {
              strcmp(type, "response.audio.delta") == 0) {  // legacy name
     const char *b64 = doc["delta"] | "";
     if (b64[0]) emitBase64Audio(b64);
+  } else if (strcmp(type, "response.output_audio_transcript.delta") == 0 ||
+             strcmp(type, "response.audio_transcript.delta") == 0) {  // legacy
+    const char *transcript = doc["delta"] | "";
+    if (transcript[0] && s_cbs.onTranscript) s_cbs.onTranscript(transcript);
   } else if (strcmp(type, "input_audio_buffer.speech_started") == 0) {
     // User is talking over the reply — barge-in.
     if (s_cbs.onInterrupted) s_cbs.onInterrupted();
@@ -167,8 +177,11 @@ void handleServerEvent(uint8_t *payload, size_t length) {
           DeserializationError::Ok) {
         const char *emotion = args["emotion"] | "";
         const char *text = args["text"] | "";
-        Serial.printf("[OpenAI] set_emotion(%s, \"%s\")\n", emotion, text);
+        const char *speech = args["speech"] | "";
+        Serial.printf("[OpenAI] set_emotion(%s, \"%s\", speech %u bytes)\n",
+                      emotion, text, (unsigned)strlen(speech));
         if (emotion[0] && s_cbs.onEmotion) s_cbs.onEmotion(emotion, text);
+        if (speech[0] && s_cbs.onReplyText) s_cbs.onReplyText(speech);
       }
     } else {
       Serial.printf("[OpenAI] Unknown tool call: %s\n", name);

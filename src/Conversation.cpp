@@ -9,6 +9,7 @@
 #include "AiEngine.h"
 #include "AudioCapture.h"
 #include "AudioPlayback.h"
+#include "SpeakServer.h"
 
 namespace {
 
@@ -24,6 +25,40 @@ bool s_conversationActive = false;
 // Set when the button aborts a reply: audio still in flight for that turn
 // is ignored instead of flipping the state back to SPEAKING.
 bool s_discardTurn = false;
+
+// Transcript of the model's spoken reply, accumulated from onTranscript
+// chunks. It is NOT sent the instant the turn ends: chunks can trail in
+// after turnComplete (and after the mid-reply interrupt/WS-drop holds), so
+// conversationLoop() posts it once no new chunk has arrived for
+// TRANSCRIPT_SETTLE_MS — one POST per reply, always the full text.
+char s_transcript[TRANSCRIPT_MAX];
+size_t s_transcriptLen = 0;
+bool s_transcriptPending = false;   // collected text not yet sent
+unsigned long s_transcriptLastChunkMs = 0;
+
+// Authoritative full reply text: the `speech` argument of the set_emotion
+// tool call, which arrives complete at the START of the reply — immune to
+// the tail-of-reply socket drops that truncate the streamed transcript.
+char s_speechText[TRANSCRIPT_MAX];
+
+void transcriptClear() {
+  s_transcriptLen = 0;
+  s_transcript[0] = '\0';
+  s_speechText[0] = '\0';
+  s_transcriptPending = false;
+}
+
+// Prefer the tool call's full text; fall back to the streamed transcript
+// only when the model didn't provide the speech argument.
+void transcriptFlush() {
+  if (s_speechText[0]) {
+    speakServerSend(s_speechText);
+  } else if (s_transcriptLen > 0) {
+    Serial.println("[Speak] No speech arg — sending streamed transcript");
+    speakServerSend(s_transcript);
+  }
+  transcriptClear();
+}
 
 // ---- AI engine callbacks (all run on the loop task) ----
 
@@ -59,7 +94,7 @@ void onDisconnected() {
     Serial.println("[State] WS drop mid-reply — holding RESULT");
     appStateSet(AssistantState::RESULT);
     displayShowConnectivity(WiFi.status() == WL_CONNECTED, false);
-    return;
+    return;  // collected transcript is sent by the settle check in the loop
   }
   appClearTurnFace();
   appStateSet(AssistantState::IDLE);
@@ -94,10 +129,17 @@ void onTurnComplete() {
   s_discardTurn = false;
   s_conversationActive = false;
   // Tail of an aborted turn (button already reset us to IDLE) — ignore.
-  if (appStateGet() == AssistantState::IDLE) return;
+  if (appStateGet() == AssistantState::IDLE) {
+    transcriptClear();
+    return;
+  }
   // Hold the reply's face + caption on the RESULT screen; the next
-  // talk-button press clears it and reopens the mic.
+  // talk-button press clears it and reopens the mic. The collected
+  // transcript is sent by the settle check in conversationLoop().
   appStateSet(AssistantState::RESULT);
+  if (!s_speechText[0] && s_transcriptLen == 0) {
+    Serial.println("[Speak] No reply text this turn — nothing to send");
+  }
 }
 
 void onInterrupted() {
@@ -110,12 +152,14 @@ void onInterrupted() {
     case AssistantState::LISTENING:
       // Reply cancelled because the user kept talking — its face is stale.
       appClearTurnFace();
+      transcriptClear();  // partial text of the cancelled reply
       break;  // stay LISTENING; the server will re-endpoint
     case AssistantState::THINKING:
     case AssistantState::SPEAKING:
       if (appTurnFaceActive()) {
         Serial.println("[State] Interrupt mid-reply — holding RESULT");
         appStateSet(AssistantState::RESULT);  // hold what was shown
+        // Transcript keeps accumulating; the settle check sends it whole.
       } else {
         appStateSet(AssistantState::IDLE);  // nothing to show yet
       }
@@ -155,6 +199,35 @@ void onEmotion(const char *emotion, const char *text) {
   appSetTurnFace(expr, (text && text[0]) ? text : fallback);
 }
 
+// Full reply text from the set_emotion tool call — arrives once, before
+// the audio. Stale calls (aborted turn, or after the turn ended) are
+// dropped, mirroring onEmotion.
+void onReplyText(const char *text) {
+  if (s_discardTurn || !text || !text[0]) return;
+  if (appStateGet() == AssistantState::IDLE ||
+      appStateGet() == AssistantState::RESULT) {
+    return;
+  }
+  snprintf(s_speechText, sizeof(s_speechText), "%s", text);
+  s_transcriptPending = true;
+  s_transcriptLastChunkMs = millis();
+}
+
+// Streamed transcript of the reply being spoken — accumulate the chunks
+// (also during RESULT, to catch trailing ones). Overflow beyond
+// TRANSCRIPT_MAX keeps the head of the reply and drops the rest.
+void onTranscript(const char *text) {
+  if (s_discardTurn || !text) return;
+  size_t n = strlen(text);
+  size_t room = sizeof(s_transcript) - 1 - s_transcriptLen;
+  if (n > room) n = room;
+  memcpy(s_transcript + s_transcriptLen, text, n);
+  s_transcriptLen += n;
+  s_transcript[s_transcriptLen] = '\0';
+  s_transcriptPending = true;
+  s_transcriptLastChunkMs = millis();
+}
+
 // ---- Button: start / stop / barge-in ----
 
 void handleButton() {
@@ -163,13 +236,17 @@ void handleButton() {
       Serial.println("[Button] Starting conversation");
       s_conversationActive = true;
       s_discardTurn = false;
+      transcriptClear();
       appStateSet(AssistantState::LISTENING);
       break;
     case AssistantState::RESULT:
-      // Done reading the held response — back to listening.
+      // Done reading the held response — back to listening. If the button
+      // beat the settle timer, send the reply text now rather than lose it.
       Serial.println("[Button] Next round — listening");
+      if (s_transcriptPending) transcriptFlush();
       s_conversationActive = true;
       s_discardTurn = false;
+      transcriptClear();
       appClearTurnFace();
       appStateSet(AssistantState::LISTENING);
       break;
@@ -186,6 +263,7 @@ void handleButton() {
       aiEngineAbort();
       audioPlaybackClear();
       appClearTurnFace();
+      transcriptClear();
       appStateSet(AssistantState::IDLE);
       break;
   }
@@ -202,11 +280,21 @@ void conversationInit() {
   cbs.onTurnComplete = onTurnComplete;
   cbs.onInterrupted = onInterrupted;
   cbs.onEmotion = onEmotion;
+  cbs.onReplyText = onReplyText;
+  cbs.onTranscript = onTranscript;
   aiEngineInit(cbs);
 }
 
 void conversationLoop(bool buttonPressed) {
   if (buttonPressed && aiEngineReady()) handleButton();
+
+  // ---- Speak relay: one POST per reply, after the transcript settles ----
+  // Runs while the RESULT screen is held; waiting for a quiet gap makes
+  // sure trailing transcript chunks made it into the message.
+  if (s_transcriptPending && appStateGet() == AssistantState::RESULT &&
+      millis() - s_transcriptLastChunkMs > TRANSCRIPT_SETTLE_MS) {
+    transcriptFlush();
+  }
 
   // ---- Uplink: pump mic PCM chunks to the engine while listening ----
   if (appStateGet() == AssistantState::LISTENING) {
