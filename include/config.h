@@ -3,8 +3,11 @@
 #include <cstdint>
 
 // Engine ids — defined before secrets.h so AI_ENGINE can be set there.
-#define AI_ENGINE_GEMINI 1
-#define AI_ENGINE_OPENAI 2
+#define AI_ENGINE_GEMINI      1  // Gemini Live API (streaming WebSocket)
+#define AI_ENGINE_OPENAI      2  // OpenAI Realtime API (streaming WebSocket)
+#define AI_ENGINE_GEMINI_REST 3  // Gemini generateContent (one HTTPS request
+                                 // per utterance, full reply in one response
+                                 // — no persistent socket to keep alive)
 
 #include "secrets.h"
 
@@ -16,6 +19,12 @@
 // Models can be overridden in secrets.h if a newer one ships.
 #ifndef GEMINI_LIVE_MODEL
 #define GEMINI_LIVE_MODEL "models/gemini-3.1-flash-live-preview"
+#endif
+// generateContent, audio-in. Verified available for this project's key on
+// 2026-07-10 (gemini-2.5-flash is "no longer available to new users").
+// flash-lite: fast, non-thinking — right latency class for a voice round.
+#ifndef GEMINI_REST_MODEL
+#define GEMINI_REST_MODEL "gemini-3.1-flash-lite"
 #endif
 #ifndef OPENAI_REALTIME_MODEL
 #define OPENAI_REALTIME_MODEL "gpt-realtime"
@@ -39,8 +48,30 @@
   "complete text of the reply you are about to speak, word for word, in "   \
   "the same language."
 
-// Longest on-screen caption kept from a set_emotion call (bytes, incl. NUL).
-constexpr size_t EMOTION_TEXT_MAX = 64;
+// Longest on-screen caption kept from a set_emotion call (bytes, incl.
+// NUL). Sized for ~6 words of Vietnamese — diacritics are 2–3 bytes each.
+constexpr size_t EMOTION_TEXT_MAX = 96;
+
+// ---- Gemini REST engine (AI_ENGINE_GEMINI_REST) ----
+// The whole utterance is recorded locally (voice-gated), then sent as one
+// WAV inside one generateContent request; the model answers with one JSON
+// object carrying the full reply. Strict JSON is requested via
+// responseMimeType, and the model also transcribes the user so multi-turn
+// context can be kept as plain text.
+#define AI_SYSTEM_PROMPT_REST                                                \
+  "You are a cheerful voice assistant living inside a small robot that "    \
+  "has a face display. You receive the user's voice message. Respond with " \
+  "ONLY a JSON object with exactly these fields: \"user_text\" - a short "  \
+  "transcription of what the user said; \"emotion\" - one of happy, sad, "  \
+  "neutral, thinking, matching how your reply feels (happy for positive "   \
+  "or friendly answers, sad for errors or bad news, neutral for plain "     \
+  "factual answers); \"text\" - a very short caption of your reply for "    \
+  "the screen, at most 6 words, in the same language the user spoke; "      \
+  "\"speech\" - your full spoken reply, one or two short sentences, no "    \
+  "lists, no markdown, in the same language the user spoke."
+
+constexpr unsigned long UTTERANCE_MAX_MS       = 12000;  // per-turn recording cap
+constexpr unsigned long GEMINI_REST_TIMEOUT_MS = 30000;  // HTTP response wait
 
 // ---- Speak server (reply-text relay) ----
 // After each spoken reply the full transcript is POSTed as plain text to
@@ -66,6 +97,15 @@ constexpr unsigned long WIFI_RECONNECT_BASE_MS   = 2000;   // doubles per failed
 constexpr unsigned long WIFI_RECONNECT_MAX_MS    = 30000;  // backoff cap
 constexpr unsigned int  WIFI_RECONNECT_MAX_SHIFT = 5;      // caps 2000 << shift before min()
 constexpr unsigned long WS_RECONNECT_INTERVAL_MS = 5000;
+// WS keepalive: ping cadence, how long a pong may take, and how many
+// misses count as a dead link. The pong shares the TCP/TLS pipe with the
+// (unused but unavoidable) TTS audio frames, so on a slow hotspot it can
+// legitimately take several seconds — err on the tolerant side; a truly
+// dead socket is still caught in ~ a minute, and WiFi loss is detected
+// separately by wifiLinkLoop().
+constexpr unsigned long WS_PING_INTERVAL_MS = 20000;
+constexpr unsigned long WS_PONG_TIMEOUT_MS  = 10000;
+constexpr uint8_t       WS_PONG_RETRIES     = 3;
 constexpr unsigned long BUTTON_DEBOUNCE_MS       = 25;
 constexpr unsigned long SETUP_TIMEOUT_MS         = 10000;  // session setup ack must arrive within this
 
@@ -113,12 +153,23 @@ constexpr unsigned long VOLUME_OVERLAY_MS = 1500;  // bar hold before face retur
 // ---- State machine ----
 // Give up on THINKING (waiting for the engine's response) after this long
 // and return to IDLE, so a dead connection can't wedge the device.
-constexpr unsigned long THINKING_TIMEOUT_MS = 15000;
+// (Sized for the REST engine too: one generateContent round trip with
+// audio input usually takes 3–8 s, occasionally more.)
+constexpr unsigned long THINKING_TIMEOUT_MS = 25000;
 
 // End a LISTENING round once the user has been silent (no frame above
 // VAD_RMS_THRESHOLD) for this long. WS drops do NOT end the round — only
 // user silence or this board's absolute backstop below.
 constexpr unsigned long LISTENING_SILENCE_TIMEOUT_MS = 15000;
+
+// Voice-gated uplink: mic chunks are streamed only while voice was heard
+// within this window. Streaming silence continuously (~43 KB/s of TLS)
+// congests a weak uplink until the WS heartbeat starves — the cause of
+// drops during long listening rounds. The window must include enough
+// trailing silence for the server VAD to endpoint an utterance (~1 s);
+// when it lapses the engine is told the pause is intentional
+// (audioStreamEnd) and the uplink resumes on the next voiced frame.
+constexpr unsigned long UPLINK_SILENCE_HANGOVER_MS = 2000;
 // Absolute cap on one LISTENING round — backstop for a mic whose noise
 // floor sits above the VAD threshold (would otherwise never look silent).
 constexpr unsigned long LISTENING_MAX_MS = 120000;

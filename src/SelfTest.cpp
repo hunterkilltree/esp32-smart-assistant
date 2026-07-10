@@ -121,6 +121,7 @@ void testWifi(SelfTestReport &report) {
   displayBootStep("WIFI");
   Serial.printf("[SelfTest] WIFI: connecting to %s...\n", WIFI_SSID);
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);  // no modem power-save — see WifiLink.cpp
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   unsigned long start = millis();

@@ -4,12 +4,16 @@
 #include <SPI.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
+#include <U8g2_for_Adafruit_GFX.h>
 
 #include "pins_config.h"
 
 namespace {
 
 Adafruit_ST7789 tft(PIN_LCD_CS, PIN_LCD_DC, PIN_LCD_RST);
+// UTF-8 renderer on top of the same panel — used for model-written text
+// (captions can be Vietnamese; the classic GFX font is ASCII-only).
+U8G2_FOR_ADAFRUIT_GFX u8f;
 
 constexpr int16_t W = 240;
 constexpr int16_t H = 240;
@@ -78,6 +82,47 @@ void printWrappedCentered(const char *s, int16_t y, int maxLines,
       line[take - 2] = line[take - 1] = '.';
     }
     printCentered(line, y + lineNo * lineH, size, color);
+  }
+}
+
+// UTF-8-aware word wrap for model captions, centered per line. Widths are
+// measured in pixels (getUTF8Width), never in bytes — Vietnamese diacritics
+// are 2–3 bytes per glyph. unifont's vietnamese2 subset covers the full
+// Vietnamese alphabet at 16 px.
+void printUtf8WrappedCentered(const char *s, int16_t y, int maxLines,
+                              uint16_t color) {
+  u8f.setFont(u8g2_font_unifont_t_vietnamese2);
+  u8f.setForegroundColor(color);
+  const int16_t maxW = W - 8;
+  const int16_t lineH = 18;
+  const int16_t baseline = 13;  // unifont ascent inside the line box
+  char line[128];
+  const char *p = s;
+  for (int ln = 0; ln < maxLines && *p; ln++) {
+    while (*p == ' ') p++;
+    size_t plen = strlen(p);
+    size_t take = 0, lastSpace = 0;
+    while (take < plen) {
+      size_t next = take + 1;  // step over one whole UTF-8 sequence
+      while (next < plen && (p[next] & 0xC0) == 0x80) next++;
+      if (next > sizeof(line) - 1) break;
+      memcpy(line, p, next);
+      line[next] = '\0';
+      if (u8f.getUTF8Width(line) > maxW) break;
+      if (p[take] == ' ') lastSpace = take;
+      take = next;
+    }
+    if (take < plen && lastSpace > 0) take = lastSpace;  // break at a space
+    if (take == 0) break;  // single glyph wider than the screen — give up
+    memcpy(line, p, take);
+    line[take] = '\0';
+    p += take;
+    while (*p == ' ') p++;
+    if (*p && ln == maxLines - 1) strlcat(line, "..", sizeof(line));
+    int16_t x = (W - (int16_t)u8f.getUTF8Width(line)) / 2;
+    if (x < 0) x = 0;
+    u8f.setCursor(x, y + ln * lineH + baseline);
+    u8f.print(line);
   }
 }
 
@@ -189,6 +234,8 @@ void displayInit() {
   SPI.begin(PIN_LCD_SCLK, -1, PIN_LCD_MOSI, PIN_LCD_CS);
   tft.init(240, 240);
   tft.setRotation(0);
+  u8f.begin(tft);
+  u8f.setFontMode(1);  // transparent glyph background
 
   displayShowSplash("SMART ASSISTANT", "ESP32-S3-EYE v2.2");
 }
@@ -305,9 +352,10 @@ void displayShowFace(Expression expr, const char *statusText,
 
   if (caption && caption[0]) {
     // Smaller face up top, the model's caption wrapped underneath, and the
-    // state text demoted to a small footer.
+    // state text demoted to a small footer. The caption is model-written
+    // text — rendered UTF-8-aware so Vietnamese diacritics show correctly.
     drawFace(W / 2, 92, 52, expr);
-    printWrappedCentered(caption, 158, 3, 2, COL_TEXT);
+    printUtf8WrappedCentered(caption, 156, 3, COL_TEXT);
     printCentered(statusText, 226, 1, accent);
   } else {
     drawFace(W / 2, 130, 72, expr);

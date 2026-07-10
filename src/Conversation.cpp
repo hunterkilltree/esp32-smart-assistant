@@ -290,6 +290,7 @@ void handleButton() {
     case AssistantState::LISTENING:
       Serial.println("[Button] Stopping conversation");
       s_conversationActive = false;
+      aiEngineAbort();  // drop any half-recorded utterance (REST engine)
       appStateSet(AssistantState::IDLE);
       break;
     case AssistantState::THINKING:
@@ -334,10 +335,32 @@ void conversationLoop(bool buttonPressed) {
   }
 
   // ---- Uplink: pump mic PCM chunks to the engine while listening ----
+  // Voice-gated: chunks are streamed only while voice was heard within the
+  // hangover window. Continuously uploading silence (~43 KB/s of TLS) is
+  // what congested the link and starved the WS heartbeat on long rounds.
   if (appStateGet() == AssistantState::LISTENING) {
     static int16_t chunk[AUDIO_CHUNK_SAMPLES];
+    static bool uplinkStreaming = false;
+    bool voiced = audioCaptureMsSinceVoice() < UPLINK_SILENCE_HANGOVER_MS;
     while (audioCaptureDequeueChunk(reinterpret_cast<uint8_t *>(chunk))) {
-      aiEngineSendAudio(chunk, AUDIO_CHUNK_SAMPLES);
+      if (voiced) aiEngineSendAudio(chunk, AUDIO_CHUNK_SAMPLES);
+    }
+    if (voiced && !uplinkStreaming) {
+      Serial.println("[Uplink] Voice — streaming mic audio");
+      uplinkStreaming = true;
+    } else if (!voiced && uplinkStreaming) {
+      uplinkStreaming = false;
+      if (aiEngineCommitUtterance()) {
+        // Request/response engine: the recorded utterance is on its way —
+        // one HTTPS round trip returns the complete reply via callbacks.
+        Serial.println("[Uplink] Utterance sent — waiting for reply");
+        appStateSet(AssistantState::THINKING);
+      } else {
+        // Streaming engine: just stop sending — no audioStreamEnd (this
+        // Gemini Live preview closes the socket on it) and automatic VAD
+        // accepts plain gaps in the realtime audio stream.
+        Serial.println("[Uplink] Silence — pausing mic stream");
+      }
     }
 
     // End the round on prolonged user silence (voice-based, so a WS drop
@@ -352,6 +375,7 @@ void conversationLoop(bool buttonPressed) {
                     silentTooLong ? "No voice from user"
                                   : "Listening round hit max length");
       s_conversationActive = false;
+      aiEngineAbort();  // drop any half-recorded utterance (REST engine)
       if (s_transcriptPending) transcriptFlush();  // don't lose reply text
       appClearTurnFace();
       appStateSet(AssistantState::IDLE);

@@ -17,6 +17,11 @@ bool s_everConnected = false;
 void connectWiFi() {
   Serial.printf("[WiFi] Connecting to %s...\n", WIFI_SSID);
   WiFi.mode(WIFI_STA);
+  // Modem power-save (the ESP32 default) periodically parks the radio,
+  // adding latency spikes that stall the TLS WebSocket long enough for its
+  // heartbeat to declare the link dead — the main source of mid-call
+  // drops. Costs some battery; this device is USB-powered.
+  WiFi.setSleep(false);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 }
 

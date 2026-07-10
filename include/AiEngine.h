@@ -64,6 +64,19 @@ bool aiEngineReady();            // session setup completed
 // No-op until aiEngineReady().
 void aiEngineSendAudio(const int16_t *pcm, size_t samples);
 
+// Tells the engine the mic stream is deliberately pausing (local VAD found
+// silence) so the gap isn't mistaken for a stall. Sending audio again
+// resumes the stream. Gemini: realtimeInput.audioStreamEnd; OpenAI: no-op
+// (server-VAD sessions tolerate uplink gaps).
+void aiEngineSendAudioStreamEnd();
+
+// Called when local VAD decides the utterance is over. Request/response
+// engines (GEMINI_REST) submit the recorded audio and return true — the
+// caller should move to THINKING and await the reply via the callbacks.
+// Streaming engines return false (endpointing is server-side; nothing to
+// commit).
+bool aiEngineCommitUtterance();
+
 // Cancels the in-flight model response (button barge-in). Local playback
 // must be cleared by the caller.
 void aiEngineAbort();

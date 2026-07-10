@@ -3,9 +3,22 @@
 // One WSS session to generativelanguage.googleapis.com running the
 // BidiGenerateContent stream: a JSON `setup` message configures the model,
 // system prompt, and the set_emotion tool; then base64 16 kHz PCM flows up
-// inside `realtimeInput` messages and base64 24 kHz PCM TTS comes back in
-// `serverContent` messages. VAD/endpointing is automatic server-side.
+// inside `realtimeInput` messages. Replies come back as TTS audio (this
+// model only supports AUDIO modality — the frames are discarded unread,
+// the board has no speaker) plus an outputTranscription of the reply text.
+// VAD/endpointing is automatic server-side.
 // Docs: https://ai.google.dev/api/live
+//
+// Threading: the WebSocket lives on its OWN FreeRTOS task (core 0, away
+// from the Arduino loop on core 1) so display draws or other main-loop
+// stalls can never delay ping/pong servicing — previously the main cause
+// of "random" disconnects. All s_ws access happens on that task:
+//   uplink   — aiEngineSendAudio() (main task) copies PCM into s_txQueue;
+//              the socket task encodes + sends.
+//   downlink — the socket task parses server messages into s_evQueue;
+//              aiEngineLoop() (main task) dispatches them to the
+//              registered callbacks, so all state logic stays single-
+//              threaded on the main loop.
 #include "config.h"
 
 #if AI_ENGINE == AI_ENGINE_GEMINI
@@ -26,31 +39,61 @@ constexpr char GEMINI_PATH_FMT[] =
 
 WebSocketsClient s_ws;
 AiEngineCallbacks s_cbs = {};
-bool s_socketConnected = false;
-bool s_ready = false;
-unsigned long s_setupSentAt = 0;
+volatile bool s_socketConnected = false;
+volatile bool s_ready = false;
+volatile unsigned long s_setupSentAt = 0;
 
 // Latest session-resumption handle (sessionResumptionUpdate messages).
 // Presented in the next setup so a reconnect restores the conversation
-// instead of starting a cold session mid-call.
+// instead of starting a cold session mid-call. Socket-task only.
 char s_resumeHandle[128] = "";
 
-// Uplink message: 60 ms of 24 kHz PCM worst-case is 2880 B -> 3840 B of
-// base64, plus the JSON envelope. One static buffer, reused every chunk.
+// ---- main task -> socket task: outgoing items ----
+enum class TxType : uint8_t { AUDIO, STREAM_END };
+constexpr size_t TX_MAX_SAMPLES = AUDIO_SAMPLE_RATE * AUDIO_CHUNK_MS / 1000;
+struct TxItem {
+  TxType type;
+  uint16_t samples;
+  int16_t pcm[TX_MAX_SAMPLES];
+};
+QueueHandle_t s_txQueue = nullptr;
+
+// ---- socket task -> main task: parsed server events ----
+enum class EvType : uint8_t {
+  READY, DISCONNECTED, TURN_COMPLETE, INTERRUPTED,
+  EMOTION, REPLY_TEXT, TRANSCRIPT,
+};
+struct Event {
+  EvType type;
+  char emotion[16];  // EMOTION only
+  char *text;        // heap-owned; freed by the dispatcher (may be null)
+};
+QueueHandle_t s_evQueue = nullptr;
+
+void queueEvent(EvType type, const char *emotion = nullptr,
+                const char *text = nullptr) {
+  Event ev = {};
+  ev.type = type;
+  if (emotion) strlcpy(ev.emotion, emotion, sizeof(ev.emotion));
+  ev.text = (text && text[0]) ? strdup(text) : nullptr;
+  if (xQueueSend(s_evQueue, &ev, 0) != pdTRUE) {
+    free(ev.text);
+    Serial.println("[Gemini] Event queue full — event dropped");
+  }
+}
+
+// Uplink message: 60 ms of PCM base64-encoded plus the JSON envelope.
+// One static buffer, reused every chunk. Socket-task only.
 char s_txBuf[6 * 1024];
 
-// Downlink PCM scratch: b64 audio is decoded in slices into this.
-uint8_t s_pcmBuf[3072];
+// ---- everything below here runs on the socket task ----
 
 void sendSetup() {
   JsonDocument doc;
   JsonObject setup = doc["setup"].to<JsonObject>();
   setup["model"] = GEMINI_LIVE_MODEL;
   // This native-audio live model only accepts AUDIO response modality
-  // (a TEXT setup gets the session closed immediately). The board has no
-  // speaker, so the audio frames are discarded unread on arrival — the
-  // reply text comes from the transcription below plus the set_emotion
-  // speech argument, and a LAN server speaks it (SpeakServer.h).
+  // (a TEXT setup gets the session closed immediately).
   setup["generationConfig"]["responseModalities"][0] = "AUDIO";
   setup["systemInstruction"]["parts"][0]["text"] = AI_SYSTEM_PROMPT;
   // Transcript of the spoken reply — arrives as
@@ -96,8 +139,6 @@ void sendSetup() {
 
   String out;
   serializeJson(doc, out);
-  // Serial.printf("[Gemini] -> setup (%s)\n", out.c_str());
-
   s_ws.sendTXT(out);
   s_setupSentAt = millis();
   Serial.printf("[Gemini] -> setup (%s)\n", GEMINI_LIVE_MODEL);
@@ -114,31 +155,6 @@ void sendToolResponse(const char *id) {
   s_ws.sendTXT(out);
 }
 
-// Decodes a base64 audio blob in slices (so arbitrarily large messages
-// never need one huge PCM buffer) and hands the PCM to onAudio. With no
-// onAudio consumer registered (no speaker wired), skips the decode.
-void emitBase64Audio(const char *b64) {
-  if (!s_cbs.onAudio) return;
-  size_t remaining = strlen(b64);
-  while (remaining >= 4) {
-    // Largest 4-multiple slice whose decoded size fits the scratch buffer.
-    size_t slice = (sizeof(s_pcmBuf) / 3) * 4;
-    if (slice > remaining) slice = remaining & ~(size_t)3;
-    size_t decoded = 0;
-    if (mbedtls_base64_decode(s_pcmBuf, sizeof(s_pcmBuf), &decoded,
-                              (const unsigned char *)b64, slice) != 0) {
-      Serial.println("[Gemini] base64 audio decode failed");
-      return;
-    }
-    if (decoded > 0 && s_cbs.onAudio) {
-      s_cbs.onAudio(reinterpret_cast<const int16_t *>(s_pcmBuf),
-                    decoded / sizeof(int16_t));
-    }
-    b64 += slice;
-    remaining -= slice;
-  }
-}
-
 void handleServerMessage(uint8_t *payload, size_t length) {
   JsonDocument doc;
   // Mutable input -> zero-copy parse: strings (the big base64 audio blob)
@@ -153,7 +169,7 @@ void handleServerMessage(uint8_t *payload, size_t length) {
   if (doc["setupComplete"].is<JsonObject>()) {
     s_ready = true;
     Serial.println("[Gemini] Setup complete — session ready");
-    if (s_cbs.onReady) s_cbs.onReady();
+    queueEvent(EvType::READY);
     return;
   }
 
@@ -168,8 +184,8 @@ void handleServerMessage(uint8_t *payload, size_t length) {
         Serial.printf("[Gemini] set_emotion(%s, \"%s\")\n", emotion, text);
         Serial.printf("[Gemini] reply text (%u bytes): \"%s\"\n",
                       (unsigned)strlen(speech), speech);
-        if (emotion[0] && s_cbs.onEmotion) s_cbs.onEmotion(emotion, text);
-        if (speech[0] && s_cbs.onReplyText) s_cbs.onReplyText(speech);
+        if (emotion[0]) queueEvent(EvType::EMOTION, emotion, text);
+        if (speech[0]) queueEvent(EvType::REPLY_TEXT, nullptr, speech);
       } else {
         Serial.printf("[Gemini] Unknown tool call: %s\n", name);
       }
@@ -182,20 +198,18 @@ void handleServerMessage(uint8_t *payload, size_t length) {
     JsonObject content = doc["serverContent"];
     if (content["interrupted"] | false) {
       Serial.println("[Gemini] Reply interrupted by user speech");
-      if (s_cbs.onInterrupted) s_cbs.onInterrupted();
+      queueEvent(EvType::INTERRUPTED);
     }
-    for (JsonObject part : content["modelTurn"]["parts"].as<JsonArray>()) {
-      const char *b64 = part["inlineData"]["data"] | "";
-      if (b64[0]) emitBase64Audio(b64);
-    }
+    // modelTurn inlineData parts are TTS audio — deliberately ignored
+    // (no speaker; skipping the decode keeps this task fast).
     const char *transcript = content["outputTranscription"]["text"] | "";
     if (transcript[0]) {
       Serial.printf("[Gemini] transcript: \"%s\"\n", transcript);
-      if (s_cbs.onTranscript) s_cbs.onTranscript(transcript);
+      queueEvent(EvType::TRANSCRIPT, nullptr, transcript);
     }
     if (content["turnComplete"] | false) {
       Serial.println("[Gemini] Turn complete");
-      if (s_cbs.onTurnComplete) s_cbs.onTurnComplete();
+      queueEvent(EvType::TURN_COMPLETE);
     }
     return;
   }
@@ -211,7 +225,7 @@ void handleServerMessage(uint8_t *payload, size_t length) {
 
   if (doc["goAway"].is<JsonObject>()) {
     // Session lifetime limit — the server will close soon; the WebSockets
-    // lib reconnects and setup re-runs (conversation context is lost).
+    // lib reconnects and setup re-runs (resumption keeps the context).
     Serial.println("[Gemini] goAway — server is ending this session");
     return;
   }
@@ -244,7 +258,7 @@ void onWsEvent(WStype_t type, uint8_t *payload, size_t length) {
         }
         s_socketConnected = false;
         s_ready = false;
-        if (s_cbs.onDisconnected) s_cbs.onDisconnected();
+        queueEvent(EvType::DISCONNECTED);
       }
       break;
     case WStype_TEXT:
@@ -260,38 +274,7 @@ void onWsEvent(WStype_t type, uint8_t *payload, size_t length) {
   }
 }
 
-}  // namespace
-
-void aiEngineInit(const AiEngineCallbacks &cbs) { s_cbs = cbs; }
-
-void aiEngineConnect() {
-  static char path[256];
-  snprintf(path, sizeof(path), GEMINI_PATH_FMT, GEMINI_API_KEY);
-  s_ws.onEvent(onWsEvent);
-  s_ws.setReconnectInterval(WS_RECONNECT_INTERVAL_MS);
-  s_ws.enableHeartbeat(15000, 3000, 2);
-  Serial.printf("[Gemini] Connecting wss://%s...\n", GEMINI_HOST);
-  // No CA pinned: the WebSockets lib falls back to setInsecure() — fine
-  // for this hobby device; pin a cert via beginSslWithCA if needed later.
-  s_ws.beginSSL(GEMINI_HOST, 443, path);
-}
-
-void aiEngineLoop() {
-  s_ws.loop();
-  // setupComplete never arrived: kill the socket and let the lib reconnect.
-  if (s_socketConnected && !s_ready &&
-      millis() - s_setupSentAt > SETUP_TIMEOUT_MS) {
-    Serial.println("[Gemini] Setup ack timeout, reconnecting");
-    s_ws.disconnect();
-  }
-}
-
-bool aiEngineSocketConnected() { return s_socketConnected; }
-bool aiEngineReady() { return s_ready; }
-
-void aiEngineSendAudio(const int16_t *pcm, size_t samples) {
-  if (!s_ready || samples == 0) return;
-
+void sendQueuedAudio(const TxItem &item) {
   static const char prefix[] =
       "{\"realtimeInput\":{\"audio\":{\"mimeType\":\"audio/pcm;rate=16000\","
       "\"data\":\"";
@@ -302,20 +285,140 @@ void aiEngineSendAudio(const int16_t *pcm, size_t samples) {
   if (mbedtls_base64_encode(
           (unsigned char *)s_txBuf + headerLen,
           sizeof(s_txBuf) - headerLen - sizeof(suffix), &b64Len,
-          (const unsigned char *)pcm, samples * sizeof(int16_t)) != 0) {
+          (const unsigned char *)item.pcm,
+          item.samples * sizeof(int16_t)) != 0) {
     Serial.println("[Gemini] uplink chunk too large for tx buffer");
     return;
   }
   memcpy(s_txBuf, prefix, headerLen);
-  memcpy(s_txBuf + headerLen + b64Len, suffix, sizeof(suffix));  // incl. NULL
+  memcpy(s_txBuf + headerLen + b64Len, suffix, sizeof(suffix));  // incl. NUL
 
   s_ws.sendTXT((uint8_t *)s_txBuf, headerLen + b64Len + sizeof(suffix) - 1);
+}
+
+void socketTask(void *) {
+  static char path[256];
+  snprintf(path, sizeof(path), GEMINI_PATH_FMT, GEMINI_API_KEY);
+  s_ws.onEvent(onWsEvent);
+  s_ws.setReconnectInterval(WS_RECONNECT_INTERVAL_MS);
+  // Generous pong tolerance: while big TTS frames stream in, the pong sits
+  // behind them in the same TCP/TLS pipe — a tight window makes the client
+  // itself kill perfectly healthy mid-reply connections.
+  s_ws.enableHeartbeat(WS_PING_INTERVAL_MS, WS_PONG_TIMEOUT_MS,
+                       WS_PONG_RETRIES);
+  Serial.printf("[Gemini] Connecting wss://%s...\n", GEMINI_HOST);
+  // No CA pinned: the WebSockets lib falls back to setInsecure() — fine
+  // for this hobby device; pin a cert via beginSslWithCA if needed later.
+  s_ws.beginSSL(GEMINI_HOST, 443, path);
+
+  static TxItem item;  // 2 KB — keep it off the task stack
+  for (;;) {
+    s_ws.loop();
+
+    while (xQueueReceive(s_txQueue, &item, 0) == pdTRUE) {
+      if (!s_ready) continue;  // discard stale uplink from before a drop
+      switch (item.type) {
+        case TxType::AUDIO:
+          sendQueuedAudio(item);
+          break;
+        case TxType::STREAM_END: {
+          // Local mutable copy: the WS library masks payloads in place.
+          char msg[] = "{\"realtimeInput\":{\"audioStreamEnd\":true}}";
+          s_ws.sendTXT((uint8_t *)msg, sizeof(msg) - 1);
+          break;
+        }
+      }
+    }
+
+    // setupComplete never arrived: kill the socket, let the lib reconnect.
+    if (s_socketConnected && !s_ready &&
+        millis() - s_setupSentAt > SETUP_TIMEOUT_MS) {
+      Serial.println("[Gemini] Setup ack timeout, reconnecting");
+      s_ws.disconnect();
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(2));
+  }
+}
+
+}  // namespace
+
+void aiEngineInit(const AiEngineCallbacks &cbs) { s_cbs = cbs; }
+
+void aiEngineConnect() {
+  if (s_txQueue) return;  // already started
+  s_txQueue = xQueueCreate(8, sizeof(TxItem));
+  s_evQueue = xQueueCreate(16, sizeof(Event));
+  // Core 0: the Arduino loop (display, state machine) runs on core 1, so
+  // the socket keeps being serviced even while the LCD is mid-redraw.
+  // 16 KB stack: TLS handshake + JSON parsing happen on this task.
+  xTaskCreatePinnedToCore(socketTask, "gemini_ws", 16384, nullptr, 2,
+                          nullptr, 0);
+}
+
+// Dispatches queued server events to the callbacks on the caller's (main)
+// task, keeping all conversation/state logic single-threaded.
+void aiEngineLoop() {
+  if (!s_evQueue) return;
+  Event ev;
+  while (xQueueReceive(s_evQueue, &ev, 0) == pdTRUE) {
+    switch (ev.type) {
+      case EvType::READY:
+        if (s_cbs.onReady) s_cbs.onReady();
+        break;
+      case EvType::DISCONNECTED:
+        if (s_cbs.onDisconnected) s_cbs.onDisconnected();
+        break;
+      case EvType::TURN_COMPLETE:
+        if (s_cbs.onTurnComplete) s_cbs.onTurnComplete();
+        break;
+      case EvType::INTERRUPTED:
+        if (s_cbs.onInterrupted) s_cbs.onInterrupted();
+        break;
+      case EvType::EMOTION:
+        if (s_cbs.onEmotion) s_cbs.onEmotion(ev.emotion, ev.text ? ev.text : "");
+        break;
+      case EvType::REPLY_TEXT:
+        if (ev.text && s_cbs.onReplyText) s_cbs.onReplyText(ev.text);
+        break;
+      case EvType::TRANSCRIPT:
+        if (ev.text && s_cbs.onTranscript) s_cbs.onTranscript(ev.text);
+        break;
+    }
+    free(ev.text);
+  }
+}
+
+bool aiEngineSocketConnected() { return s_socketConnected; }
+bool aiEngineReady() { return s_ready; }
+
+void aiEngineSendAudio(const int16_t *pcm, size_t samples) {
+  if (!s_ready || samples == 0 || !s_txQueue) return;
+  if (samples > TX_MAX_SAMPLES) samples = TX_MAX_SAMPLES;
+  static TxItem item;  // only ever touched by the main task
+  item.type = TxType::AUDIO;
+  item.samples = (uint16_t)samples;
+  memcpy(item.pcm, pcm, samples * sizeof(int16_t));
+  // Queue full = uplink backpressure — drop the chunk rather than block.
+  xQueueSend(s_txQueue, &item, 0);
+}
+
+void aiEngineSendAudioStreamEnd() {
+  if (!s_ready || !s_txQueue) return;
+  static TxItem item;
+  item.type = TxType::STREAM_END;
+  item.samples = 0;
+  xQueueSend(s_txQueue, &item, 0);
 }
 
 void aiEngineAbort() {
   // Gemini Live has no explicit cancel message — interruption is driven by
   // new user audio server-side. The caller clears local playback; the
   // remainder of the in-flight reply is discarded as it arrives.
+}
+
+bool aiEngineCommitUtterance() {
+  return false;  // streaming engine — the server endpoints the utterance
 }
 
 const char *aiEngineName() { return "Gemini Live"; }

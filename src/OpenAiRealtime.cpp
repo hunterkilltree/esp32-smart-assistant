@@ -243,7 +243,8 @@ void aiEngineConnect() {
   s_ws.setExtraHeaders(headers);
   s_ws.onEvent(onWsEvent);
   s_ws.setReconnectInterval(WS_RECONNECT_INTERVAL_MS);
-  s_ws.enableHeartbeat(15000, 3000, 2);
+  s_ws.enableHeartbeat(WS_PING_INTERVAL_MS, WS_PONG_TIMEOUT_MS,
+                       WS_PONG_RETRIES);  // see GeminiLive.cpp
   Serial.printf("[OpenAI] Connecting wss://%s%s...\n", OPENAI_HOST, path);
   // No CA pinned: the WebSockets lib falls back to setInsecure() — fine
   // for this hobby device; pin a cert via beginSslWithCA if needed later.
@@ -282,6 +283,14 @@ void aiEngineSendAudio(const int16_t *pcm, size_t samples) {
   memcpy(s_txBuf, prefix, headerLen);
   memcpy(s_txBuf + headerLen + b64Len, suffix, sizeof(suffix));  // incl. NUL
   s_ws.sendTXT((uint8_t *)s_txBuf, headerLen + b64Len + sizeof(suffix) - 1);
+}
+
+void aiEngineSendAudioStreamEnd() {
+  // input_audio_buffer.append gaps are fine under server VAD — no signal.
+}
+
+bool aiEngineCommitUtterance() {
+  return false;  // streaming engine — the server endpoints the utterance
 }
 
 void aiEngineAbort() {

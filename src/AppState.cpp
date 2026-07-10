@@ -34,6 +34,17 @@ void appSetTurnFace(Expression expr, const char *caption) {
   s_turnFaceActive = true;
   s_turnExpr = expr;
   strlcpy(s_turnCaption, caption ? caption : "", sizeof(s_turnCaption));
+  // If truncation cut a multi-byte UTF-8 glyph in half (Vietnamese
+  // captions), drop the dangling fragment so the renderer never sees it.
+  size_t len = strlen(s_turnCaption);
+  size_t start = len;
+  while (start > 0 && (s_turnCaption[start - 1] & 0xC0) == 0x80) start--;
+  if (start > 0) {
+    unsigned char lead = s_turnCaption[start - 1];
+    size_t need = (lead >= 0xF0) ? 4 : (lead >= 0xE0) ? 3
+                : (lead >= 0xC0) ? 2 : 1;
+    if (len - (start - 1) < need) s_turnCaption[start - 1] = '\0';
+  }
   appRepaintFace();
 }
 
