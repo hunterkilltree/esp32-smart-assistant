@@ -233,7 +233,7 @@ void displayInit() {
 
   SPI.begin(PIN_LCD_SCLK, -1, PIN_LCD_MOSI, PIN_LCD_CS);
   tft.init(240, 240);
-  tft.setRotation(0);
+  tft.setRotation(2);  // 90° clockwise (use 3 for 90° counter-clockwise)
   u8f.begin(tft);
   u8f.setFontMode(1);  // transparent glyph background
 

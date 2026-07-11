@@ -33,6 +33,10 @@ constexpr char GEMINI_REST_URL_FMT[] =
     "https://generativelanguage.googleapis.com/v1beta/models/"
     "%s:generateContent?key=%s";
 
+// Set to true to Serial-dump every request body exactly as sent to Gemini
+// (the base64 audio is elided — only its length is printed).
+constexpr bool GEMINI_REST_LOG_TX = true;
+
 AiEngineCallbacks s_cbs = {};
 // "Ready" simply means WiFi is up — there is no session to establish.
 bool s_wifiWasUp = false;
@@ -158,6 +162,7 @@ size_t buildRequestBody() {
   ok = ok && appendRaw(p,
       "{\"role\":\"user\",\"parts\":[{\"inlineData\":{\"mimeType\":"
       "\"audio/wav\",\"data\":\"");
+  const char *b64Start = p;
   if (ok) {
     size_t room = s_bodyCap - (p - s_body);
     size_t b64Len = 0;
@@ -168,10 +173,19 @@ size_t buildRequestBody() {
       p += b64Len;
     }
   }
+  const char *b64End = p;
   ok = ok && appendRaw(p, "\"}}]}]}");
   if (!ok) {
     Serial.println("[GeminiRest] Request body overflow");
     return 0;
+  }
+  if (GEMINI_REST_LOG_TX) {
+    Serial.printf("[GeminiRest] TX body (%u bytes, audio elided):\n",
+                  (unsigned)(p - s_body));
+    Serial.write((const uint8_t *)s_body, b64Start - s_body);
+    Serial.printf("<%u base64 audio chars>", (unsigned)(b64End - b64Start));
+    Serial.write((const uint8_t *)b64End, p - b64End);
+    Serial.println();
   }
   return p - s_body;
 }
