@@ -81,7 +81,7 @@ constexpr unsigned long GEMINI_REST_TIMEOUT_MS = 30000;  // HTTP response wait
 // this LAN endpoint (see src/SpeakServer.cpp). Override in secrets.h, or
 // define it empty ("") there to disable the relay.
 #ifndef SPEAK_SERVER_URL
-#define SPEAK_SERVER_URL "http://192.168.1.77:8080/speak"
+#define SPEAK_SERVER_URL "http://10.211.117.179:8080/speak"
 #endif
 constexpr unsigned long SPEAK_SERVER_TIMEOUT_MS      = 3000;   // TCP connect
 // The server may only answer after it finishes speaking the text — allow it
