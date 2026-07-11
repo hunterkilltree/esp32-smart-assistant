@@ -70,6 +70,12 @@ void aiEngineSendAudio(const int16_t *pcm, size_t samples);
 // (server-VAD sessions tolerate uplink gaps).
 void aiEngineSendAudioStreamEnd();
 
+// Attaches a camera snapshot (JPEG) to the round being started: it is sent
+// alongside the next committed utterance, then dropped. The frame is copied
+// out, so the caller's buffer can be released immediately. Request/response
+// engines only (GEMINI_REST); streaming engines ignore it.
+void aiEngineSendImage(const uint8_t *jpeg, size_t len);
+
 // Called when local VAD decides the utterance is over. Request/response
 // engines (GEMINI_REST) submit the recorded audio and return true — the
 // caller should move to THINKING and await the reply via the callbacks.

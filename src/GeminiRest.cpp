@@ -53,9 +53,17 @@ volatile bool s_requestPending = false;  // worker owns s_wav while true
 volatile uint32_t s_generation = 0;      // bumped by abort — stale replies drop
 size_t s_reqWavLen = 0;                  // total WAV bytes handed to worker
 
-// Request body assembly buffer (PSRAM): JSON envelope + base64 WAV.
+// Request body assembly buffer (PSRAM): JSON envelope + base64 WAV + JPEG.
 size_t s_bodyCap = 0;
 char *s_body = nullptr;
+
+// Camera snapshot for the current round (PSRAM), captured at the button
+// press and sent as an image/jpeg part next to the utterance WAV. Written
+// by the main task only while no request is pending (the worker owns it
+// between commit and completion); one-shot — cleared after each request.
+constexpr size_t JPEG_MAX_BYTES = 96 * 1024;  // VGA q12 is typically 20-40 KB
+uint8_t *s_jpeg = nullptr;
+size_t s_jpegLen = 0;
 
 // ---- short conversation memory, kept as text on both sides ----
 struct TurnPair {
@@ -117,6 +125,18 @@ bool appendEscaped(char *&p, const char *s) {
   return true;
 }
 
+// Base64-encodes `len` bytes of `data` at *p, bounded by the end of s_body.
+bool appendBase64(char *&p, const uint8_t *data, size_t len) {
+  size_t room = s_bodyCap - (p - s_body);
+  size_t b64Len = 0;
+  if (mbedtls_base64_encode((unsigned char *)p, room, &b64Len, data, len) !=
+      0) {
+    return false;
+  }
+  p += b64Len;
+  return true;
+}
+
 void writeWavHeader(uint8_t *h, uint32_t pcmBytes) {
   const uint32_t rate = AUDIO_SAMPLE_RATE, byteRate = rate * 2;
   memcpy(h, "RIFF", 4);
@@ -159,32 +179,42 @@ size_t buildRequestBody() {
     ok = ok && appendEscaped(p, s_history[i].model);
     ok = ok && appendRaw(p, "\"}]},");
   }
-  ok = ok && appendRaw(p,
-      "{\"role\":\"user\",\"parts\":[{\"inlineData\":{\"mimeType\":"
-      "\"audio/wav\",\"data\":\"");
-  const char *b64Start = p;
-  if (ok) {
-    size_t room = s_bodyCap - (p - s_body);
-    size_t b64Len = 0;
-    if (mbedtls_base64_encode((unsigned char *)p, room, &b64Len, s_wav,
-                              s_reqWavLen) != 0) {
-      ok = false;
-    } else {
-      p += b64Len;
-    }
+  // Final user turn: the round's camera snapshot (if one was captured),
+  // then the utterance WAV. History stays text-only — the image is sent
+  // once and dropped.
+  ok = ok && appendRaw(p, "{\"role\":\"user\",\"parts\":[");
+  const char *imgB64Start = p, *imgB64End = p;
+  size_t jpegLen = s_jpegLen;  // read once — abort may clear it mid-build
+  if (jpegLen > 0) {
+    ok = ok && appendRaw(p,
+        "{\"inlineData\":{\"mimeType\":\"image/jpeg\",\"data\":\"");
+    imgB64Start = p;
+    ok = ok && appendBase64(p, s_jpeg, jpegLen);
+    imgB64End = p;
+    ok = ok && appendRaw(p, "\"}},");
   }
-  const char *b64End = p;
+  ok = ok && appendRaw(p,
+      "{\"inlineData\":{\"mimeType\":\"audio/wav\",\"data\":\"");
+  const char *wavB64Start = p;
+  ok = ok && appendBase64(p, s_wav, s_reqWavLen);
+  const char *wavB64End = p;
   ok = ok && appendRaw(p, "\"}}]}]}");
   if (!ok) {
     Serial.println("[GeminiRest] Request body overflow");
     return 0;
   }
   if (GEMINI_REST_LOG_TX) {
-    Serial.printf("[GeminiRest] TX body (%u bytes, audio elided):\n",
+    Serial.printf("[GeminiRest] TX body (%u bytes, base64 blobs elided):\n",
                   (unsigned)(p - s_body));
-    Serial.write((const uint8_t *)s_body, b64Start - s_body);
-    Serial.printf("<%u base64 audio chars>", (unsigned)(b64End - b64Start));
-    Serial.write((const uint8_t *)b64End, p - b64End);
+    Serial.write((const uint8_t *)s_body, imgB64Start - s_body);
+    if (imgB64End > imgB64Start) {
+      Serial.printf("<%u base64 image chars>",
+                    (unsigned)(imgB64End - imgB64Start));
+    }
+    Serial.write((const uint8_t *)imgB64End, wavB64Start - imgB64End);
+    Serial.printf("<%u base64 audio chars>",
+                  (unsigned)(wavB64End - wavB64Start));
+    Serial.write((const uint8_t *)wavB64End, p - wavB64End);
     Serial.println();
   }
   return p - s_body;
@@ -291,6 +321,7 @@ void workerTask(void *) {
       Serial.println("[GeminiRest] Reply for an aborted turn");
     }
     s_pcmLen = 0;
+    s_jpegLen = 0;  // snapshot is one-shot — never resend it
     s_requestPending = false;
   }
 }
@@ -303,8 +334,12 @@ void aiEngineConnect() {
   if (s_evQueue) return;  // already started
   s_wav = (uint8_t *)heap_caps_malloc(WAV_HEADER_BYTES + PCM_MAX_BYTES,
                                       MALLOC_CAP_SPIRAM);
-  // Envelope + history + base64 WAV (4/3 of the raw bytes) + slack.
-  s_bodyCap = 4096 + ((WAV_HEADER_BYTES + PCM_MAX_BYTES) * 4) / 3 + 256;
+  // Optional — a failed alloc just means rounds go out without a snapshot.
+  s_jpeg = (uint8_t *)heap_caps_malloc(JPEG_MAX_BYTES, MALLOC_CAP_SPIRAM);
+  if (!s_jpeg) Serial.println("[GeminiRest] No JPEG buffer — audio only");
+  // Envelope + history + base64 WAV and JPEG (4/3 of raw) + slack.
+  s_bodyCap = 4096 + ((WAV_HEADER_BYTES + PCM_MAX_BYTES) * 4) / 3 +
+              (JPEG_MAX_BYTES * 4) / 3 + 512;
   s_body = (char *)heap_caps_malloc(s_bodyCap, MALLOC_CAP_SPIRAM);
   if (!s_wav || !s_body) {
     Serial.println("[GeminiRest] PSRAM alloc failed — engine disabled");
@@ -360,6 +395,23 @@ void aiEngineSendAudio(const int16_t *pcm, size_t samples) {
 
 void aiEngineSendAudioStreamEnd() {}  // meaningless without a stream
 
+void aiEngineSendImage(const uint8_t *jpeg, size_t len) {
+  if (!s_jpeg || !jpeg || len == 0) return;
+  if (s_requestPending) {  // worker owns s_jpeg — don't race it
+    Serial.println("[GeminiRest] Snapshot skipped — request in flight");
+    return;
+  }
+  if (len > JPEG_MAX_BYTES) {
+    Serial.printf("[GeminiRest] Snapshot too big (%u KB) — skipped\n",
+                  (unsigned)(len / 1024));
+    return;
+  }
+  memcpy(s_jpeg, jpeg, len);
+  s_jpegLen = len;
+  Serial.printf("[GeminiRest] Snapshot attached (%u KB)\n",
+                (unsigned)(len / 1024));
+}
+
 bool aiEngineCommitUtterance() {
   // Require at least ~200 ms of audio so stray noise blips don't fire a
   // whole round trip.
@@ -378,6 +430,9 @@ bool aiEngineCommitUtterance() {
 void aiEngineAbort() {
   s_generation++;   // a reply already in flight belongs to a dead turn
   s_pcmLen = 0;     // drop any half-recorded utterance
+  // Drop the round's snapshot too — unless the worker owns it right now
+  // (it clears it itself when the in-flight request finishes).
+  if (!s_requestPending) s_jpegLen = 0;
 }
 
 const char *aiEngineName() { return "Gemini REST"; }

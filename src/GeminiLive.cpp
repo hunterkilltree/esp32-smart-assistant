@@ -421,6 +421,11 @@ bool aiEngineCommitUtterance() {
   return false;  // streaming engine — the server endpoints the utterance
 }
 
+void aiEngineSendImage(const uint8_t *, size_t) {
+  // Not wired for the Live API (would go out as a realtimeInput video
+  // frame); snapshots are a GEMINI_REST feature for now.
+}
+
 const char *aiEngineName() { return "Gemini Live"; }
 
 #endif  // AI_ENGINE == AI_ENGINE_GEMINI

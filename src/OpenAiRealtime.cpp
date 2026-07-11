@@ -300,6 +300,11 @@ void aiEngineAbort() {
   sendJson(doc);
 }
 
+void aiEngineSendImage(const uint8_t *, size_t) {
+  // Realtime sessions are audio-only here — snapshots are a GEMINI_REST
+  // feature for now.
+}
+
 const char *aiEngineName() { return "OpenAI Realtime"; }
 
 #endif  // AI_ENGINE == AI_ENGINE_OPENAI

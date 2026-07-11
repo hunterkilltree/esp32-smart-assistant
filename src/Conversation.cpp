@@ -9,6 +9,7 @@
 #include "AiEngine.h"
 #include "AudioCapture.h"
 #include "AudioPlayback.h"
+#include "CameraCapture.h"
 #include "SpeakServer.h"
 
 namespace {
@@ -267,6 +268,20 @@ void onTranscript(const char *text) {
 
 // ---- Button: start / stop / barge-in ----
 
+// Snapshot for the round being started, handed to the engine so it goes to
+// the model next to the utterance audio. The driver keeps 2 PSRAM frame
+// buffers that were filled whenever they were last drained (possibly at
+// boot) — flush them first so the frame sent is what the lens sees NOW.
+void attachSnapshot() {
+  cameraCaptureSnapshot(nullptr);
+  cameraCaptureSnapshot(nullptr);
+  if (!cameraCaptureSnapshot([](const uint8_t *jpeg, size_t len) {
+        aiEngineSendImage(jpeg, len);
+      })) {
+    Serial.println("[Camera] No snapshot for this round");
+  }
+}
+
 void handleButton() {
   switch (appStateGet()) {
     case AssistantState::IDLE:
@@ -275,6 +290,7 @@ void handleButton() {
       s_discardTurn = false;
       transcriptClear();
       appStateSet(AssistantState::LISTENING);
+      attachSnapshot();
       break;
     case AssistantState::RESULT:
       // Done reading the held response — back to listening. If the button
@@ -286,6 +302,7 @@ void handleButton() {
       transcriptClear();
       appClearTurnFace();
       appStateSet(AssistantState::LISTENING);
+      attachSnapshot();
       break;
     case AssistantState::LISTENING:
       Serial.println("[Button] Stopping conversation");
